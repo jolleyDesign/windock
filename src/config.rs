@@ -233,6 +233,21 @@ impl Default for Animation {
     }
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Shortcuts {
+    /// Modifiers that, with 1-9 (0 for the 10th), open or switch to that pinned app.
+    pub open_app: String,
+    /// Shows or hides the dock.
+    pub toggle_dock: String,
+}
+
+impl Default for Shortcuts {
+    fn default() -> Self {
+        Self { open_app: "ctrl+alt".into(), toggle_dock: "win+shift+d".into() }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 pub struct Pinned {
     pub path: String,
@@ -251,6 +266,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub magnification: Magnification,
     pub animation: Animation,
+    pub shortcuts: Shortcuts,
     pub pinned: Vec<Pinned>,
 }
 
@@ -365,7 +381,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
-    for section in ["dock", "appearance", "magnification", "animation"] {
+    for section in ["dock", "appearance", "magnification", "animation", "shortcuts"] {
         let Some(values) = fresh.get(section).and_then(|i| i.as_table()) else { continue };
         if !doc.contains_table(section) {
             doc[section] = toml_edit::table();
@@ -554,6 +570,12 @@ range = 3.0                  # how many neighbouring icons grow along with it
 enabled = true
 speed = 1.0
 bounce_on_launch = true
+
+[shortcuts]
+# Modifiers that, with 1-9 (0 for the 10th), open or switch to that pinned app. "" turns it off.
+# On keyboards with an AltGr key, Ctrl+Alt also types characters like @; use "win+ctrl+alt".
+open_app = "ctrl+alt"
+toggle_dock = "win+shift+d"  # show or hide the dock; "" turns it off
 "##;
 
 const PINNED_COMMENT: &str = r"

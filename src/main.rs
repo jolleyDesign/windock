@@ -3,6 +3,7 @@
 mod app;
 mod apps;
 mod config;
+mod hotkeys;
 mod icons;
 mod logo;
 mod render;
@@ -13,6 +14,7 @@ mod util;
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW};
@@ -33,7 +35,8 @@ fn main() {
             return;
         }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // OLE (not just COM) so the dock can be a drag-and-drop target.
+        let _ = OleInitialize(None);
     }
     crate::log!("starting Windock {}", env!("CARGO_PKG_VERSION"));
     if let Err(e) = app::run() {

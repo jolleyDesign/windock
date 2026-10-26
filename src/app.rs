@@ -1,11 +1,13 @@
 //! The dock window: layout, magnification, input, window tracking and animation.
 
+mod droptarget;
 mod preview;
 
 use crate::apps::{self, AppKey};
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
 use crate::icons::{IconLoader, IconPixels};
 use crate::render::{Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface};
+use crate::hotkeys;
 use crate::shell;
 use crate::taskbar;
 use crate::util::{from_wide, wide};
@@ -24,7 +26,7 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, INFINITE, WaitForSi
 use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
@@ -36,11 +38,16 @@ const WM_APP_FOREGROUND: u32 = WM_APP + 2;
 const WM_APP_ICONS: u32 = WM_APP + 3;
 const WM_APP_CONFIG: u32 = WM_APP + 4;
 const WM_APP_APPBAR: u32 = WM_APP + 5;
+const WM_APP_DROP: u32 = WM_APP + 6;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
 const TIMER_HIDE: usize = 3;
 const TIMER_NOTICE: usize = 4;
+
+/// Hotkey ids: HOTKEY_APP + n opens pinned app n (0-based); HOTKEY_TOGGLE shows/hides the dock.
+const HOTKEY_APP: i32 = 1;
+const HOTKEY_TOGGLE: i32 = 20;
 
 const CMD_OPEN: u32 = 1;
 const CMD_PIN: u32 = 2;
@@ -338,7 +345,14 @@ pub struct App {
     anchor: f32,
     press: Option<Press>,
     drag: Option<Drag>,
+    /// Files being dragged over the dock from another app.
+    dragging: Option<droptarget::Dragging>,
+    /// A drop waiting to be carried out (see `drag_drop`).
+    dropped: Option<(droptarget::DropAction, Vec<String>)>,
     menu_open: bool,
+    hotkeys: Vec<i32>,
+    /// Hidden with the show/hide shortcut.
+    user_hidden: bool,
 
     layout: Layout,
     hide: f32,
@@ -409,7 +423,11 @@ impl App {
             anchor: 0.0,
             press: None,
             drag: None,
+            dragging: None,
+            dropped: None,
             menu_open: false,
+            hotkeys: Vec::new(),
+            user_hidden: false,
             layout: Layout::default(),
             hide: 0.0,
             hide_target: 0.0,
@@ -454,6 +472,8 @@ impl App {
         }
         self.place();
         self.refresh_windows();
+        droptarget::register(self.hwnd);
+        self.register_hotkeys();
         watch_config(self.cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf());
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -469,6 +489,8 @@ impl App {
 
     fn shutdown(&mut self) {
         self.close_preview();
+        droptarget::unregister(self.hwnd);
+        self.unregister_hotkeys();
         unsafe {
             for h in self.hooks.drain(..) {
                 let _ = UnhookWinEvent(h);
@@ -507,6 +529,9 @@ impl App {
                 let old = std::mem::replace(&mut self.cfg, cfg);
                 if old.dock.autostart != self.cfg.dock.autostart {
                     shell::set_autostart(self.cfg.dock.autostart);
+                }
+                if old.shortcuts != self.cfg.shortcuts {
+                    self.register_hotkeys();
                 }
                 if old.dock.show_all_desktops != self.cfg.dock.show_all_desktops {
                     self.refresh_windows();
@@ -739,10 +764,91 @@ impl App {
         let fs = self.cfg.dock.hide_on_fullscreen && apps::fullscreen_app_on(self.monitor);
         if fs != self.fullscreen {
             self.fullscreen = fs;
+            self.apply_visibility();
+        }
+    }
+
+    /// The dock window is hidden while a full-screen app runs or after the show/hide shortcut.
+    fn apply_visibility(&mut self) {
+        let hidden = self.fullscreen || self.user_hidden;
+        if hidden {
+            self.close_preview();
+        }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        }
+        self.dirty = true;
+    }
+
+    // -------------------------------------------------------------- hotkeys
+
+    fn unregister_hotkeys(&mut self) {
+        for id in self.hotkeys.drain(..) {
             unsafe {
-                let _ = ShowWindow(self.hwnd, if fs { SW_HIDE } else { SW_SHOWNOACTIVATE });
+                let _ = UnregisterHotKey(Some(self.hwnd), id);
+            }
+        }
+    }
+
+    fn register_hotkeys(&mut self) {
+        self.unregister_hotkeys();
+        let mut wanted: Vec<(i32, u32, u32)> = Vec::new();
+        let mut problems: Vec<String> = Vec::new();
+        match hotkeys::parse_modifiers(&self.cfg.shortcuts.open_app) {
+            // 1-9, then 0 for the tenth pinned app.
+            Ok(Some(mods)) => wanted.extend((0..10).map(|n| (HOTKEY_APP + n, mods, if n == 9 { 0x30 } else { 0x31 + n as u32 }))),
+            Ok(None) => {}
+            Err(e) => problems.push(format!("open_app: {e}")),
+        }
+        match hotkeys::parse_shortcut(&self.cfg.shortcuts.toggle_dock) {
+            Ok(Some((mods, vk))) => wanted.push((HOTKEY_TOGGLE, mods, vk)),
+            Ok(None) => {}
+            Err(e) => problems.push(format!("toggle_dock: {e}")),
+        }
+        let mut taken = Vec::new();
+        for (id, mods, vk) in wanted {
+            let flags = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
+            if unsafe { RegisterHotKey(Some(self.hwnd), id, flags, vk) }.is_ok() {
+                self.hotkeys.push(id);
+            } else {
+                taken.push(hotkeys::describe(mods, vk));
+            }
+        }
+        if !taken.is_empty() {
+            let list = if taken.len() > 3 { format!("{} and {} more", taken[..2].join(", "), taken.len() - 2) } else { taken.join(", ") };
+            problems.push(format!("{list} already used by another app"));
+        }
+        if !problems.is_empty() {
+            crate::log!("shortcuts: {}", problems.join("; "));
+            self.show_notice(format!("Shortcuts: {}", problems.join("; ")), NOTICE_TIME);
+        }
+    }
+
+    fn on_hotkey(&mut self, id: i32) {
+        if id == HOTKEY_TOGGLE {
+            self.toggle_dock();
+            return;
+        }
+        let n = (id - HOTKEY_APP) as usize;
+        if let Some(i) = self.items.iter().position(|it| it.kind == Kind::Pinned(n) && !it.dying) {
+            self.click(i);
+        }
+    }
+
+    /// With auto-hide, slides the dock in (or away); otherwise hides or shows it.
+    fn toggle_dock(&mut self) {
+        if self.cfg.dock.autohide {
+            if self.hide_target >= 1.0 {
+                self.hide_target = 0.0;
+                self.schedule_hide(self.cfg.dock.autohide_delay_ms + 2000);
+            } else {
+                self.close_preview();
+                self.hide_target = 1.0;
             }
             self.dirty = true;
+        } else {
+            self.user_hidden = !self.user_hidden;
+            self.apply_visibility();
         }
     }
 
@@ -1106,6 +1212,7 @@ impl App {
             .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id));
         let label_req = match (&self.notice, hovered) {
             (Some((text, _)), _) => Some((text.clone(), (b0 + b1) / 2.0, m.margin + m.thick)),
+            _ if self.dragging.is_some() => self.drop_label(),
             (None, Some(i)) => self.icon_uv(i).map(|(u0, u1, _, v1)| (self.items[i].name.clone(), (u0 + u1) / 2.0, v1)),
             _ => None,
         };
@@ -1449,43 +1556,6 @@ impl App {
         }
     }
 
-    fn on_drop(&mut self, hdrop: HDROP) {
-        let mut paths = Vec::new();
-        let mut pt = POINT::default();
-        unsafe {
-            let _ = DragQueryPoint(hdrop, &mut pt);
-            let n = DragQueryFileW(hdrop, u32::MAX, None);
-            for i in 0..n {
-                let len = DragQueryFileW(hdrop, i, None) as usize;
-                let mut buf = vec![0u16; len + 1];
-                DragQueryFileW(hdrop, i, Some(&mut buf));
-                paths.push(from_wide(&buf));
-            }
-            DragFinish(hdrop);
-        }
-        let (dx, dy) = self.axis.toward_edge(self.slide_distance());
-        let (u, _) = self.axis.uv(pt.x as f32 - dx, pt.y as f32 - dy);
-        let mut at = self
-            .items
-            .iter()
-            .zip(&self.layout.slots)
-            .filter(|(it, s)| matches!(it.kind, Kind::Pinned(_)) && !it.dying && s.center < u)
-            .count();
-        let mut added = false;
-        for path in paths {
-            if self.cfg.pinned.iter().any(|p| p.path.eq_ignore_ascii_case(&path)) {
-                continue;
-            }
-            self.cfg.pinned.insert(at.min(self.cfg.pinned.len()), Pinned { path, ..Default::default() });
-            at += 1;
-            added = true;
-        }
-        if added {
-            self.save_pins();
-            self.rebuild_items();
-        }
-    }
-
     // ----------------------------------------------------------------- menu
 
     fn menu_spec(&mut self, x: f32, y: f32) -> MenuSpec {
@@ -1606,7 +1676,8 @@ impl App {
                 }
             }
             WM_MOUSEACTIVATE => return Some(LRESULT(MA_NOACTIVATE as isize)),
-            WM_DROPFILES => self.on_drop(HDROP(wp.0 as _)),
+            WM_HOTKEY => self.on_hotkey(wp.0 as i32),
+            WM_APP_DROP => self.finish_drop(),
             WM_TIMER => {
                 self.kill_timer(wp.0);
                 match wp.0 {
@@ -1814,7 +1885,7 @@ pub fn run() -> Result<()> {
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_ACCEPTFILES,
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             class,
             w!("Windock"),
             WS_POPUP,

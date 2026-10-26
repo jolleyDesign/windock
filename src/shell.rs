@@ -6,7 +6,7 @@ use std::path::Path;
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
@@ -98,6 +98,60 @@ pub fn resolve_lnk(path: &str) -> (Option<String>, Option<String>) {
             .filter(|s| !s.is_empty());
         (target, aumid)
     }
+}
+
+/// What a shortcut runs: target, arguments and working folder.
+fn lnk_command(path: &str) -> Option<(String, String, Option<String>)> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        windows::core::Interface::cast::<IPersistFile>(&link).ok()?.Load(&HSTRING::from(path), STGM_READ).ok()?;
+        let mut buf = [0u16; 1024];
+        link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let target = from_wide(&buf);
+        if target.is_empty() {
+            return None;
+        }
+        let mut args = [0u16; 4096];
+        let _ = link.GetArguments(&mut args);
+        let mut dir = [0u16; 1024];
+        let _ = link.GetWorkingDirectory(&mut dir);
+        Some((target, from_wide(&args), Some(from_wide(&dir)).filter(|d| !d.is_empty())))
+    }
+}
+
+/// Opens files with an app: an .exe, a shortcut (its target gets the files after its own
+/// arguments) or a Store app ('shell:AppsFolder\<AUMID>').
+pub fn open_with(app: &str, app_args: Option<&str>, cwd: Option<&str>, files: &[String]) -> bool {
+    if let Some(aumid) = apps_folder_aumid(app) {
+        return activate_with_files(aumid, files);
+    }
+    let quoted: Vec<String> = files.iter().map(|f| format!("\"{f}\"")).collect();
+    let (program, base_args, dir) = if app.to_lowercase().ends_with(".lnk") {
+        match lnk_command(app) {
+            Some((target, args, dir)) => (target, args, dir.or(cwd.map(str::to_owned))),
+            // Advertised (installer) shortcuts have no plain target; let the shell run them.
+            None => (app.to_string(), String::new(), cwd.map(str::to_owned)),
+        }
+    } else {
+        (app.to_string(), app_args.unwrap_or_default().to_string(), cwd.map(str::to_owned))
+    };
+    let args = [base_args.trim().to_string(), quoted.join(" ")].join(" ").trim().to_string();
+    launch(&program, Some(&args), dir.as_deref())
+}
+
+/// Starts a Store app with the files as its command line. Packaged desktop apps (Notepad,
+/// Terminal, Paint...) open them; classic UWP apps receive them as launch arguments.
+/// (ActivateForFile only works for UWP apps that declare the file type, and is slow to fail.)
+fn activate_with_files(aumid: &str, files: &[String]) -> bool {
+    let args: Vec<String> = files.iter().map(|f| format!("\"{f}\"")).collect();
+    let result = unsafe {
+        CoCreateInstance::<_, IApplicationActivationManager>(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
+            .and_then(|m| m.ActivateApplication(&HSTRING::from(aumid), &HSTRING::from(args.join(" ")), AO_NONE))
+    };
+    if let Err(e) = &result {
+        crate::log!("couldn't open files with {aumid}: {e}");
+    }
+    result.is_ok()
 }
 
 /// "FileDescription" from an executable's version resource, e.g. "Microsoft Edge".

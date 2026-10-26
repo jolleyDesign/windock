@@ -2,6 +2,7 @@
 //! reloads the file, so every change shows up live.
 
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Pinned, Position, Theme};
+use crate::hotkeys;
 use crate::shell;
 use eframe::egui;
 use std::collections::HashMap;
@@ -226,6 +227,12 @@ impl Settings {
         c |= toggle(ui, &mut d.show_labels, "Show app names", "On hover");
         c |= toggle(ui, &mut d.previews, "Window previews", "Hover a running app to see its windows");
         c |= toggle(ui, &mut d.click_minimizes, "Click to minimize", "Clicking the focused app minimizes it");
+
+        section(ui, "Shortcuts");
+        let s = &mut self.cfg.shortcuts;
+        c |= shortcut_field(ui, "Open pinned app", &mut s.open_app, "With 1–9, e.g. ctrl+alt", |t| hotkeys::parse_modifiers(t).map(|_| ()));
+        c |= shortcut_field(ui, "Show or hide dock", &mut s.toggle_dock, "e.g. win+shift+d", |t| hotkeys::parse_shortcut(t).map(|_| ()));
+        let d = &mut self.cfg.dock;
 
         section(ui, "System");
         c |= toggle(ui, &mut d.autostart, "Start at sign-in", "");
@@ -480,6 +487,31 @@ impl eframe::App for Settings {
             self.save_now();
         }
     }
+}
+
+/// A shortcut text box with helper text, or the problem if it can't be read.
+fn shortcut_field(ui: &mut egui::Ui, label: &str, value: &mut String, help: &str, check: impl Fn(&str) -> Result<(), String>) -> bool {
+    let mut changed = false;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(150.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(150.0);
+                ui.label(label);
+            });
+            changed = ui.add(egui::TextEdit::singleline(value).desired_width(180.0).hint_text("off")).changed();
+        });
+        let note = match check(value) {
+            Ok(()) => egui::RichText::new(help).small().weak(),
+            Err(e) => egui::RichText::new(e).small().color(ui.visuals().warn_fg_color),
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(150.0 + ui.spacing().item_spacing.x);
+            ui.label(note);
+        });
+    });
+    ui.add_space(4.0);
+    changed
 }
 
 /// A checkbox with a short label and, optionally, a line of helper text beneath it.

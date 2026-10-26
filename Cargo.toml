@@ -9,6 +9,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 toml_edit = "0.23"
 windows-numerics = "0.3"
+# For #[implement] (the drop target COM object).
+windows-core = "0.62"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 
 [dependencies.windows]
@@ -39,6 +41,8 @@ features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

@@ -6,7 +6,8 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - Live window previews on hover, like the Windows taskbar
 - macOS-style magnification (optional), frosted-glass background, light/dark theme that follows Windows
 - Bottom, top, left or right edge, any monitor, optional auto-hide
-- Drag icons to reorder, drop files onto the dock to pin them, drag an icon off to remove it
+- Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
+- Keyboard shortcuts for pinned apps and for showing the dock
 - Hot-reloaded TOML config
 - Native Rust + Win32: uses no CPU when idle, ~25 MB RAM, one ~700 KB `.exe`, no runtime to install
 
@@ -22,7 +23,10 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Right-click | Pick a window (when there are several), Open, New window, Keep in dock / Remove from dock, Close windows, Import taskbar pins, Dock settings…, Quit |
 | Drag an icon along the dock | Reorder pinned apps |
 | Drag an icon off the dock and release | Unpin it |
-| Drop files, shortcuts or folders onto the dock | Pin them at that position |
+| Drop files onto an app | Open them with that app |
+| Drop files, shortcuts or folders between apps | Pin them at that position (programs and shortcuts always pin) |
+| Ctrl+Alt+1–9 (0 for the 10th) | Open or switch to that pinned app, like clicking it |
+| Win+Shift+D | Show or hide the dock (with auto-hide: slide it in) |
 
 ## Configuration
 
@@ -68,6 +72,10 @@ enabled = true
 speed = 1.0
 bounce_on_launch = true
 
+[shortcuts]
+open_app = "ctrl+alt"    # + 1-9 opens pinned app N; "" turns it off ("win+ctrl+alt" on AltGr keyboards)
+toggle_dock = "win+shift+d"
+
 [[pinned]]
 path = 'C:\Windows\explorer.exe'          # .exe, .lnk, folder, or
 name = "File Explorer"                    # 'shell:AppsFolder\<AppUserModelID>' for Store apps
@@ -97,6 +105,8 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | --- | --- |
 | `src/app.rs` | The dock window: layout, magnification, input, drag & drop, auto-hide, animation loop |
 | `src/app/preview.rs` | The hover popup with live DWM window thumbnails |
+| `src/app/droptarget.rs` | Files dragged onto the dock: open with an app, or pin |
+| `src/hotkeys.rs` | Parsing shortcut strings like `win+shift+d` |
 | `src/settings.rs` | The settings window (`windock.exe --settings`, egui) |
 | `src/taskbar.rs` | Reads the taskbar's pinned apps for importing |
 | `src/logo.rs`, `build.rs` | The app icon, drawn in code and embedded at build time |
