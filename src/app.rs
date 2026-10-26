@@ -1,0 +1,1784 @@
+//! The dock window: layout, magnification, input, window tracking and animation.
+
+use crate::apps::{self, AppKey};
+use crate::config::{self, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
+use crate::icons::{IconLoader, IconPixels};
+use crate::render::{Frame, IconDraw, LabelDraw, RectF, Renderer, Shape};
+use crate::shell;
+use crate::taskbar;
+use crate::util::{from_wide, wide};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::f32::consts::PI;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmFlush, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Storage::FileSystem::{FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindFirstChangeNotificationW, FindNextChangeNotification};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetCurrentProcessId, INFINITE, WaitForSingleObject};
+use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const HSHELL_FLASH: u32 = 0x8006;
+const WM_APP_REFRESH: u32 = WM_APP + 1;
+const WM_APP_FOREGROUND: u32 = WM_APP + 2;
+const WM_APP_ICONS: u32 = WM_APP + 3;
+const WM_APP_CONFIG: u32 = WM_APP + 4;
+const WM_APP_APPBAR: u32 = WM_APP + 5;
+
+const TIMER_REFRESH: usize = 1;
+const TIMER_CONFIG: usize = 2;
+const TIMER_HIDE: usize = 3;
+const TIMER_NOTICE: usize = 4;
+
+const CMD_OPEN: u32 = 1;
+const CMD_PIN: u32 = 2;
+const CMD_UNPIN: u32 = 3;
+const CMD_CLOSE: u32 = 4;
+const CMD_SETTINGS: u32 = 5;
+const CMD_QUIT: u32 = 6;
+const CMD_IMPORT: u32 = 7;
+
+/// One hop of the launch bounce, in seconds.
+const BOUNCE_PERIOD: f32 = 0.55;
+const NOTICE_TIME: Duration = Duration::from_secs(8);
+const INFO_TIME: Duration = Duration::from_secs(3);
+
+static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
+static SHELLHOOK_MSG: AtomicU32 = AtomicU32::new(0);
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Windows currently shown in the dock; read by the WinEvent hook to filter noise.
+    static TRACKED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+}
+
+/// Runs `f` against the app unless it is already borrowed further up the stack
+/// (Win32 re-enters the window procedure from calls like SetWindowPos).
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut a| a.as_mut().map(f)))
+}
+
+fn dock_hwnd() -> HWND {
+    HWND(DOCK_HWND.load(Ordering::Relaxed) as _)
+}
+
+fn post(msg: u32, wp: usize) {
+    unsafe {
+        let _ = PostMessageW(Some(dock_hwnd()), msg, WPARAM(wp), LPARAM(0));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Pinned(usize),
+    Running,
+    Separator,
+}
+
+#[derive(Clone, Debug)]
+struct Launch {
+    path: String,
+    args: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Item {
+    id: String,
+    kind: Kind,
+    name: String,
+    icon: String,
+    key: AppKey,
+    /// Windows in the order they were first seen (stable for cycling).
+    windows: Vec<isize>,
+    launch: Option<Launch>,
+    mag: f32,
+    appear: f32,
+    dying: bool,
+    shift: f32,
+    bounce: Option<f32>,
+    bounce_end: f32,
+}
+
+impl Item {
+    fn new(id: String, kind: Kind, name: String, icon: String, key: AppKey, launch: Option<Launch>) -> Self {
+        Self {
+            id,
+            kind,
+            name,
+            icon,
+            key,
+            windows: Vec::new(),
+            launch,
+            mag: 1.0,
+            appear: 1.0,
+            dying: false,
+            shift: 0.0,
+            bounce: None,
+            bounce_end: 0.0,
+        }
+    }
+
+    fn interactive(&self) -> bool {
+        !self.dying && self.kind != Kind::Separator
+    }
+}
+
+/// Maps dock-relative coordinates to window pixels. `u` runs along the dock,
+/// `v` runs away from the screen edge the dock is attached to.
+#[derive(Clone, Copy, Default)]
+struct Axis {
+    pos: Position,
+    w: f32,
+    h: f32,
+}
+
+impl Axis {
+    fn horizontal(&self) -> bool {
+        matches!(self.pos, Position::Bottom | Position::Top)
+    }
+    fn main(&self) -> f32 {
+        if self.horizontal() { self.w } else { self.h }
+    }
+    fn xy(&self, u: f32, v: f32) -> (f32, f32) {
+        match self.pos {
+            Position::Bottom => (u, self.h - v),
+            Position::Top => (u, v),
+            Position::Left => (v, u),
+            Position::Right => (self.w - v, u),
+        }
+    }
+    fn uv(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.pos {
+            Position::Bottom => (x, self.h - y),
+            Position::Top => (x, y),
+            Position::Left => (y, x),
+            Position::Right => (y, self.w - x),
+        }
+    }
+    fn rect(&self, u0: f32, u1: f32, v0: f32, v1: f32) -> RectF {
+        let (ax, ay) = self.xy(u0, v0);
+        let (bx, by) = self.xy(u1, v1);
+        RectF { l: ax.min(bx), t: ay.min(by), r: ax.max(bx), b: ay.max(by) }
+    }
+    /// Screen offset that pushes the dock `d` pixels toward its edge.
+    fn toward_edge(&self, d: f32) -> (f32, f32) {
+        match self.pos {
+            Position::Bottom => (0.0, d),
+            Position::Top => (0.0, -d),
+            Position::Left => (-d, 0.0),
+            Position::Right => (d, 0.0),
+        }
+    }
+}
+
+/// Sizes in physical pixels for the current monitor.
+#[derive(Clone, Copy, Default)]
+struct Metrics {
+    s: f32,
+    icon: f32,
+    gap: f32,
+    /// Padding at the ends of the dock (along it).
+    pad_main: f32,
+    /// Padding beside the icons (across the dock).
+    pad_cross: f32,
+    margin: f32,
+    thick: f32,
+    radius: f32,
+    sep: f32,
+    mag: f32,
+    range: f32,
+    bounce: f32,
+    cross: f32,
+}
+
+impl Metrics {
+    fn new(cfg: &Config, s: f32, horizontal: bool) -> Self {
+        let a = &cfg.appearance;
+        let icon = (a.icon_size * s).round();
+        // padding_x/padding_y are screen directions, so which one runs along the dock depends on the edge.
+        let (px, py) = ((a.padding_x() * s).round(), (a.padding_y() * s).round());
+        let (pad_main, pad_cross) = if horizontal { (px, py) } else { (py, px) };
+        let gap = a.spacing * s;
+        let margin = (a.edge_margin * s).round();
+        let thick = icon + 2.0 * pad_cross;
+        let mag = if cfg.magnification.enabled { cfg.magnification.scale } else { 1.0 };
+        let bounce = icon * 0.5;
+        // Room for the hover label (or a notice) beyond the tallest icon.
+        let label_room = if horizontal { (a.label_size * 1.4 + 22.0) * s } else { 300.0 * s };
+        let cross = margin + pad_cross + (icon * mag).max(icon + bounce) + pad_cross.max(4.0 * s) + label_room;
+        Self {
+            s,
+            icon,
+            gap,
+            pad_main,
+            pad_cross,
+            margin,
+            thick,
+            radius: (a.corner_radius * s).min(thick / 2.0),
+            sep: gap.max(4.0 * s),
+            mag,
+            range: cfg.magnification.range,
+            bounce,
+            cross,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    u0: f32,
+    w: f32,
+    center: f32,
+    size: f32,
+}
+
+#[derive(Clone, Default)]
+struct Layout {
+    slots: Vec<Slot>,
+    bar: (f32, f32),
+}
+
+struct Press {
+    id: Option<String>,
+    x: f32,
+    y: f32,
+}
+
+struct Drag {
+    id: String,
+    original: Vec<Pinned>,
+    removing: bool,
+}
+
+pub struct MenuSpec {
+    item: Option<String>,
+    entries: Vec<(u32, String)>,
+    align: TRACK_POPUP_MENU_FLAGS,
+}
+
+fn approach(x: &mut f32, target: f32, k: f32, eps: f32) -> bool {
+    if (target - *x).abs() <= eps {
+        let moved = *x != target;
+        *x = target;
+        moved
+    } else {
+        *x += (target - *x) * k;
+        true
+    }
+}
+
+pub struct App {
+    hwnd: HWND,
+    own_pid: u32,
+    cfg: Config,
+    cfg_path: PathBuf,
+    cfg_text: String,
+    palette: Palette,
+    blur: bool,
+    renderer: Option<Renderer>,
+    render_failures: u32,
+    monitor: HMONITOR,
+    axis: Axis,
+    m: Metrics,
+    icon_px: u32,
+    icons: HashMap<String, Option<IconPixels>>,
+    loader: IconLoader,
+
+    windows: Vec<(isize, AppKey)>,
+    keys: HashMap<isize, (AppKey, u64)>,
+    seq: u64,
+    fg: isize,
+    attention: HashSet<isize>,
+    pins: HashMap<String, (AppKey, String)>,
+    names: HashMap<String, String>,
+    items: Vec<Item>,
+    first_build: bool,
+
+    cursor: Option<(f32, f32)>,
+    tracking: bool,
+    anchor: f32,
+    press: Option<Press>,
+    drag: Option<Drag>,
+    menu_open: bool,
+
+    layout: Layout,
+    hide: f32,
+    hide_target: f32,
+    fullscreen: bool,
+    dirty: bool,
+    animating: bool,
+    last: Instant,
+    region: Vec<RECT>,
+    /// Text shown above the dock, and when it disappears.
+    notice: Option<(String, Instant)>,
+    first_run: bool,
+    reserved: Option<RECT>,
+    hooks: Vec<HWINEVENTHOOK>,
+}
+
+impl App {
+    fn new(hwnd: HWND) -> Self {
+        let cfg_path = config::config_path();
+        let first_run = !cfg_path.exists();
+        let (parsed, cfg_text) = config::load(&cfg_path);
+        let mut notice = None;
+        let cfg = parsed.unwrap_or_else(|e| {
+            crate::log!("config error: {e}");
+            notice = Some((config_error(&e), Instant::now() + NOTICE_TIME));
+            config::parse(&config::default_text()).unwrap_or_default()
+        });
+        unsafe {
+            // Lets the compositor's host-backdrop brush see what's behind the dock.
+            let on = BOOL(1);
+            let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(17), &on as *const _ as _, 4);
+        }
+        let renderer = Renderer::new(hwnd, 1, 1, cfg.dock.gpu)
+            .inspect_err(|e| crate::log!("renderer init failed: {e}"))
+            .ok();
+        Self {
+            hwnd,
+            own_pid: unsafe { GetCurrentProcessId() },
+            palette: cfg.palette(true, true),
+            cfg,
+            cfg_path,
+            cfg_text,
+            blur: true,
+            renderer,
+            render_failures: 0,
+            monitor: HMONITOR::default(),
+            axis: Axis::default(),
+            m: Metrics::default(),
+            icon_px: 0,
+            icons: HashMap::new(),
+            loader: IconLoader::new(hwnd, WM_APP_ICONS),
+            windows: Vec::new(),
+            keys: HashMap::new(),
+            seq: 0,
+            fg: 0,
+            attention: HashSet::new(),
+            pins: HashMap::new(),
+            names: HashMap::new(),
+            items: Vec::new(),
+            first_build: true,
+            cursor: None,
+            tracking: false,
+            anchor: 0.0,
+            press: None,
+            drag: None,
+            menu_open: false,
+            layout: Layout::default(),
+            hide: 0.0,
+            hide_target: 0.0,
+            fullscreen: false,
+            dirty: true,
+            animating: false,
+            last: Instant::now(),
+            region: Vec::new(),
+            notice,
+            first_run,
+            reserved: None,
+            hooks: Vec::new(),
+        }
+    }
+
+    fn start(&mut self) {
+        unsafe {
+            SHELLHOOK_MSG.store(RegisterWindowMessageW(w!("SHELLHOOK")), Ordering::Relaxed);
+            TASKBAR_CREATED_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+            let _ = RegisterShellHookWindow(self.hwnd);
+            for (lo, hi) in [
+                (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+                (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+                (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
+                (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
+            ] {
+                let hook = SetWinEventHook(lo, hi, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+                if !hook.is_invalid() {
+                    self.hooks.push(hook);
+                }
+            }
+        }
+        self.appbar_register();
+        self.apply_theme();
+        shell::set_autostart(self.cfg.dock.autostart);
+        if self.first_run {
+            // Start from whatever is pinned to the taskbar, keeping the built-in defaults otherwise.
+            let defaults = std::mem::take(&mut self.cfg.pinned);
+            if self.import_taskbar_pins() == 0 {
+                self.cfg.pinned = defaults;
+            }
+        }
+        self.place();
+        self.refresh_windows();
+        watch_config(self.cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.check_fullscreen();
+        if self.cfg.dock.autohide {
+            self.schedule_hide(self.cfg.dock.autohide_delay_ms + 1500);
+        }
+        if self.notice.is_some() {
+            self.set_timer(TIMER_NOTICE, NOTICE_TIME.as_millis() as u32);
+        }
+    }
+
+    fn shutdown(&mut self) {
+        unsafe {
+            for h in self.hooks.drain(..) {
+                let _ = UnhookWinEvent(h);
+            }
+            let _ = DeregisterShellHookWindow(self.hwnd);
+        }
+        self.appbar_message(ABM_REMOVE);
+    }
+
+    fn wants_frame(&self) -> bool {
+        self.dirty || self.animating
+    }
+
+    fn set_timer(&self, id: usize, ms: u32) {
+        unsafe {
+            SetTimer(Some(self.hwnd), id, ms, None);
+        }
+    }
+
+    fn kill_timer(&self, id: usize) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), id);
+        }
+    }
+
+    // ---------------------------------------------------------------- config
+
+    fn reload_config(&mut self) {
+        let (parsed, text) = config::load(&self.cfg_path);
+        if text == self.cfg_text {
+            return;
+        }
+        self.cfg_text = text;
+        match parsed {
+            Ok(cfg) => {
+                let old = std::mem::replace(&mut self.cfg, cfg);
+                if old.dock.autostart != self.cfg.dock.autostart {
+                    shell::set_autostart(self.cfg.dock.autostart);
+                }
+                if old.dock.gpu != self.cfg.dock.gpu {
+                    self.renderer = None;
+                    self.recreate_renderer();
+                }
+                if !self.cfg.dock.autohide {
+                    self.hide_target = 0.0;
+                } else if !old.dock.autohide {
+                    self.schedule_hide(self.cfg.dock.autohide_delay_ms);
+                }
+                self.notice = None;
+                self.apply_theme();
+                self.place();
+                self.rebuild_items();
+                self.check_fullscreen();
+                crate::log!("config reloaded");
+            }
+            Err(e) => {
+                crate::log!("config error: {e}");
+                self.show_notice(config_error(&e), NOTICE_TIME);
+            }
+        }
+    }
+
+    fn show_notice(&mut self, text: String, duration: Duration) {
+        self.notice = Some((text, Instant::now() + duration));
+        self.set_timer(TIMER_NOTICE, duration.as_millis() as u32);
+        self.hide_target = 0.0;
+        self.dirty = true;
+    }
+
+    fn save_pins(&mut self) {
+        match config::save_pinned(&self.cfg_path, &self.cfg.pinned) {
+            Ok(text) => self.cfg_text = text,
+            Err(e) => self.show_notice(format!("Couldn't save config: {e}"), NOTICE_TIME),
+        }
+    }
+
+    /// Adds taskbar pins that aren't in the dock yet. Shortcuts are copied into Windock's own
+    /// folder so they keep working if they're later unpinned from the taskbar.
+    fn import_taskbar_pins(&mut self) -> usize {
+        let mut existing: Vec<(AppKey, String, String)> = Vec::new();
+        for p in self.cfg.pinned.clone() {
+            let path = shell::expand_env(&p.path);
+            let (key, name) = self.pin_info(&path);
+            existing.push((key, p.name.unwrap_or(name), path));
+        }
+        let folder = crate::util::data_dir().join("Pinned");
+        let mut added = 0;
+        for pin in taskbar::pinned() {
+            let (source, file) = match &pin {
+                taskbar::Pin::Shortcut(p) => (p.to_string_lossy().into_owned(), p.file_name().map(|f| f.to_string_lossy().into_owned())),
+                taskbar::Pin::App(aumid) => (format!("{}{aumid}", shell::APPS_FOLDER), None),
+            };
+            if matches!(pin, taskbar::Pin::App(_)) && shell::display_name(&source).is_none() {
+                continue; // not an installed app
+            }
+            let (key, name) = self.pin_info(&source);
+            let duplicate = existing
+                .iter()
+                .any(|(k, n, p)| k.matches(&key) || n.eq_ignore_ascii_case(&name) || p.eq_ignore_ascii_case(&source));
+            if duplicate {
+                continue;
+            }
+            let path = match file {
+                Some(file) => {
+                    let copied = std::fs::create_dir_all(&folder).and_then(|_| std::fs::copy(&source, folder.join(&file)));
+                    if let Err(e) = copied {
+                        crate::log!("couldn't copy {source}: {e}");
+                        continue;
+                    }
+                    format!(r"%APPDATA%\Windock\Pinned\{file}")
+                }
+                None => source.clone(),
+            };
+            self.cfg.pinned.push(Pinned { path, ..Default::default() });
+            existing.push((key, name, source));
+            added += 1;
+        }
+        crate::log!("imported {added} taskbar pins");
+        if added > 0 {
+            self.save_pins();
+            self.rebuild_items();
+        }
+        added
+    }
+
+    fn apply_theme(&mut self) {
+        let dark = match self.cfg.appearance.theme {
+            config::Theme::Auto => shell::system_dark_mode(),
+            config::Theme::Dark => true,
+            config::Theme::Light => false,
+        };
+        self.blur = self.cfg.appearance.blur && shell::transparency_enabled();
+        self.palette = self.cfg.palette(dark, self.blur);
+        shell::set_menu_theme(self.cfg.appearance.theme);
+        self.dirty = true;
+    }
+
+    // ------------------------------------------------------------- placement
+
+    fn place(&mut self) {
+        let monitors = monitors();
+        let primary = monitors.iter().find(|(_, mi)| mi.dwFlags & MONITORINFOF_PRIMARY != 0).or(monitors.first());
+        let chosen = match &self.cfg.dock.monitor {
+            MonitorSel::Index(i) => monitors.get(*i).or(primary),
+            MonitorSel::Name(_) => primary,
+        };
+        let Some(&(hmon, mi)) = chosen else { return };
+        self.monitor = hmon;
+
+        let (mut dx, mut dy) = (96u32, 96u32);
+        unsafe {
+            let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+        }
+        let s = dx as f32 / 96.0;
+        let pos = self.cfg.dock.position;
+        let horizontal = matches!(pos, Position::Bottom | Position::Top);
+        self.m = Metrics::new(&self.cfg, s, horizontal);
+        let cross = self.m.cross.ceil() as i32;
+
+        let mut area = mi.rcWork;
+        if self.cfg.dock.reserve_space && !self.cfg.dock.autohide {
+            let rc = self.appbar_reserve(mi.rcMonitor, (self.m.margin + self.m.thick).ceil() as i32);
+            match pos {
+                Position::Bottom => area.bottom = rc.bottom,
+                Position::Top => area.top = rc.top,
+                Position::Left => area.left = rc.left,
+                Position::Right => area.right = rc.right,
+            }
+        } else if self.reserved.take().is_some() {
+            // Give the space back, but stay registered for full-screen notifications.
+            self.appbar_message(ABM_REMOVE);
+            self.appbar_register();
+        }
+
+        let (x, y, w, h) = match pos {
+            Position::Bottom => (area.left, area.bottom - cross, area.right - area.left, cross),
+            Position::Top => (area.left, area.top, area.right - area.left, cross),
+            Position::Left => (area.left, area.top, cross, area.bottom - area.top),
+            Position::Right => (area.right - cross, area.top, cross, area.bottom - area.top),
+        };
+        let z = if self.cfg.dock.always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(z), x, y, w, h, SWP_NOACTIVATE);
+        }
+        self.axis = Axis { pos, w: w as f32, h: h as f32 };
+        if let Some(r) = &mut self.renderer {
+            let _ = r.resize(w as u32, h as u32);
+            r.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * s);
+        }
+
+        // Load icons at the largest size they'll be drawn.
+        let px = (((self.m.icon * self.m.mag).ceil() as u32).div_ceil(16) * 16).clamp(32, 256);
+        if px != self.icon_px {
+            self.icon_px = px;
+            self.icons.clear();
+            self.loader.reset();
+            if let Some(r) = &mut self.renderer {
+                r.clear_bitmaps();
+            }
+            self.request_icons();
+        }
+        self.region.clear();
+        self.layout = self.compute_layout();
+        self.dirty = true;
+    }
+
+    fn appbar_data(&self) -> APPBARDATA {
+        APPBARDATA {
+            cbSize: size_of::<APPBARDATA>() as u32,
+            hWnd: self.hwnd,
+            uCallbackMessage: WM_APP_APPBAR,
+            uEdge: match self.cfg.dock.position {
+                Position::Left => ABE_LEFT,
+                Position::Top => ABE_TOP,
+                Position::Right => ABE_RIGHT,
+                Position::Bottom => ABE_BOTTOM,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn appbar_message(&self, msg: u32) {
+        let mut abd = self.appbar_data();
+        unsafe {
+            SHAppBarMessage(msg, &mut abd);
+        }
+    }
+
+    /// Registering as an app bar gets us full-screen notifications even without reserving space.
+    fn appbar_register(&self) {
+        self.appbar_message(ABM_NEW);
+    }
+
+    fn appbar_reserve(&mut self, mon: RECT, thick: i32) -> RECT {
+        let mut abd = self.appbar_data();
+        abd.rc = match self.cfg.dock.position {
+            Position::Bottom => RECT { top: mon.bottom - thick, ..mon },
+            Position::Top => RECT { bottom: mon.top + thick, ..mon },
+            Position::Left => RECT { right: mon.left + thick, ..mon },
+            Position::Right => RECT { left: mon.right - thick, ..mon },
+        };
+        unsafe {
+            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+            match self.cfg.dock.position {
+                Position::Bottom => abd.rc.top = abd.rc.bottom - thick,
+                Position::Top => abd.rc.bottom = abd.rc.top + thick,
+                Position::Left => abd.rc.right = abd.rc.left + thick,
+                Position::Right => abd.rc.left = abd.rc.right - thick,
+            }
+            if self.reserved != Some(abd.rc) {
+                SHAppBarMessage(ABM_SETPOS, &mut abd);
+                self.reserved = Some(abd.rc);
+            }
+        }
+        abd.rc
+    }
+
+    fn check_fullscreen(&mut self) {
+        let fs = self.cfg.dock.hide_on_fullscreen && apps::fullscreen_app_on(self.monitor);
+        if fs != self.fullscreen {
+            self.fullscreen = fs;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, if fs { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            }
+            self.dirty = true;
+        }
+    }
+
+    // ---------------------------------------------------------------- model
+
+    fn refresh_windows(&mut self) {
+        let hwnds = apps::app_windows(self.own_pid);
+        let mut list = Vec::with_capacity(hwnds.len());
+        for h in hwnds {
+            let id = h.0 as isize;
+            let cached = self.keys.get(&id).filter(|(k, _)| {
+                // A UWP frame's app process can appear after the frame; keep re-checking those.
+                !k.exe.as_deref().is_some_and(|e| e.to_lowercase().ends_with("applicationframehost.exe"))
+            });
+            let key = match cached {
+                Some((k, _)) => k.clone(),
+                None => {
+                    let k = apps::window_key(h);
+                    let seq = self.keys.get(&id).map(|(_, s)| *s).unwrap_or_else(|| {
+                        self.seq += 1;
+                        self.seq
+                    });
+                    self.keys.insert(id, (k.clone(), seq));
+                    k
+                }
+            };
+            list.push((id, key));
+        }
+        self.keys.retain(|id, _| list.iter().any(|(h, _)| h == id));
+        self.attention.retain(|id| list.iter().any(|(h, _)| h == id));
+        TRACKED.with(|t| *t.borrow_mut() = list.iter().map(|(h, _)| *h).collect());
+        self.windows = list;
+        self.fg = apps::foreground().0 as isize;
+        self.rebuild_items();
+    }
+
+    fn pin_info(&mut self, path: &str) -> (AppKey, String) {
+        if let Some(info) = self.pins.get(path) {
+            return info.clone();
+        }
+        let info = if let Some(aumid) = shell::apps_folder_aumid(path) {
+            let key = AppKey { aumid: Some(aumid.to_string()), exe: None, packaged: true };
+            (key, shell::display_name(path).unwrap_or_else(|| aumid.to_string()))
+        } else if path.to_lowercase().ends_with(".lnk") {
+            let (target, aumid) = shell::resolve_lnk(path);
+            let name = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            (AppKey { aumid, exe: target, packaged: false }, name)
+        } else {
+            (AppKey { aumid: None, exe: Some(path.to_string()), packaged: false }, shell::friendly_name(path))
+        };
+        self.pins.insert(path.to_string(), info.clone());
+        info
+    }
+
+    fn running_name(&mut self, key: &AppKey, hwnd: isize) -> String {
+        let gid = key.group_id();
+        if let Some(n) = self.names.get(&gid) {
+            return n.clone();
+        }
+        let name = match (&key.aumid, &key.exe) {
+            (Some(a), _) if key.packaged => shell::display_name(&format!("{}{a}", shell::APPS_FOLDER)),
+            (_, Some(exe)) => Some(shell::friendly_name(exe)),
+            _ => None,
+        }
+        .unwrap_or_else(|| apps::title(HWND(hwnd as _)));
+        self.names.insert(gid, name.clone());
+        name
+    }
+
+    fn rebuild_items(&mut self) {
+        let mut items = Vec::new();
+        for (i, p) in self.cfg.pinned.clone().iter().enumerate() {
+            let path = shell::expand_env(&p.path);
+            let (key, default_name) = self.pin_info(&path);
+            let launch = Launch { path: path.clone(), args: p.args.clone(), cwd: p.working_dir.clone() };
+            items.push(Item::new(
+                format!("p:{}", path.to_lowercase()),
+                Kind::Pinned(i),
+                p.name.clone().unwrap_or(default_name),
+                path,
+                key,
+                Some(launch),
+            ));
+        }
+        let pinned = items.len();
+
+        let mut wins: Vec<(isize, AppKey, u64)> = self
+            .windows
+            .iter()
+            .map(|(h, k)| (*h, k.clone(), self.keys.get(h).map(|(_, s)| *s).unwrap_or(0)))
+            .collect();
+        wins.sort_by_key(|w| w.2);
+        let mut running: Vec<Item> = Vec::new();
+        for (h, key, _) in wins {
+            if let Some(it) = items[..pinned].iter_mut().find(|it| it.key.matches(&key)) {
+                it.windows.push(h);
+                continue;
+            }
+            if !self.cfg.dock.show_running {
+                continue;
+            }
+            let gid = key.group_id();
+            if let Some(it) = running.iter_mut().find(|it| it.id == gid) {
+                it.windows.push(h);
+                continue;
+            }
+            let name = self.running_name(&key, h);
+            let source = match (&key.aumid, &key.exe) {
+                (Some(a), _) if key.packaged => Some(format!("{}{a}", shell::APPS_FOLDER)),
+                (_, Some(exe)) => Some(exe.clone()),
+                _ => None,
+            };
+            let launch = source.clone().map(|path| Launch { path, args: None, cwd: None });
+            let mut it = Item::new(gid, Kind::Running, name, source.unwrap_or_default(), key, launch);
+            it.windows.push(h);
+            running.push(it);
+        }
+        if pinned > 0 && !running.is_empty() {
+            items.push(Item::new("sep".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
+        }
+        items.extend(running);
+
+        // Carry animation state across rebuilds; new items grow in, removed ones shrink out.
+        let old = std::mem::take(&mut self.items);
+        for it in &mut items {
+            match old.iter().find(|o| o.id == it.id) {
+                Some(o) => {
+                    it.mag = o.mag;
+                    it.appear = o.appear;
+                    it.shift = o.shift;
+                    it.bounce = o.bounce;
+                    it.bounce_end = o.bounce_end;
+                    // The app opened a window: finish the current hop and stop bouncing.
+                    if let Some(t) = it.bounce.filter(|_| it.windows.len() > o.windows.len()) {
+                        it.bounce_end = it.bounce_end.min(((t / BOUNCE_PERIOD).ceil() * BOUNCE_PERIOD).max(BOUNCE_PERIOD));
+                    }
+                }
+                None => it.appear = if self.first_build { 1.0 } else { 0.0 },
+            }
+        }
+        for (i, mut o) in old.into_iter().enumerate() {
+            if o.appear > 0.0 && !items.iter().any(|n| n.id == o.id) {
+                o.dying = true;
+                o.windows.clear();
+                items.insert(i.min(items.len()), o);
+            }
+        }
+        self.items = items;
+        self.first_build = false;
+        self.request_icons();
+        self.layout = self.compute_layout();
+        self.dirty = true;
+    }
+
+    fn request_icons(&mut self) {
+        for it in &self.items {
+            if it.kind != Kind::Separator && !it.icon.is_empty() && !self.icons.contains_key(&it.icon) {
+                self.loader.request(&it.icon, self.icon_px);
+            }
+        }
+    }
+
+    fn take_icons(&mut self) {
+        for l in self.loader.take_loaded() {
+            self.icons.insert(l.source, l.pixels);
+        }
+        self.dirty = true;
+    }
+
+    // --------------------------------------------------------------- layout
+
+    fn base_size(&self, it: &Item) -> f32 {
+        if it.kind == Kind::Separator { self.m.sep } else { self.m.icon }
+    }
+
+    /// Lays icons out at their current magnification, anchored so the point under the
+    /// cursor stays put (the macOS behaviour) and centred when nothing is magnified.
+    fn compute_layout(&self) -> Layout {
+        let m = &self.m;
+        let center = self.axis.main() / 2.0;
+        let w0: Vec<f32> = self.items.iter().map(|it| it.appear * (self.base_size(it) + m.gap)).collect();
+        let w1: Vec<f32> = self.items.iter().map(|it| it.appear * (self.base_size(it) * it.mag + m.gap)).collect();
+        let (l0, l1): (f32, f32) = (w0.iter().sum(), w1.iter().sum());
+        let s0 = center - l0 / 2.0;
+        let c = self.anchor;
+        let start = if l0 <= 0.0 || c <= s0 {
+            s0 - (l1 - l0) * if l0 <= 0.0 { 0.5 } else { 0.0 }
+        } else if c >= s0 + l0 {
+            s0 + l0 - l1
+        } else {
+            let (mut acc0, mut acc1, mut start) = (s0, 0.0, s0);
+            for i in 0..w0.len() {
+                if c < acc0 + w0[i] || i + 1 == w0.len() {
+                    let t = if w0[i] > 0.0 { (c - acc0) / w0[i] } else { 0.0 };
+                    start = c - (acc1 + t * w1[i]);
+                    break;
+                }
+                acc0 += w0[i];
+                acc1 += w1[i];
+            }
+            start
+        };
+        let mut u = start;
+        let slots = self
+            .items
+            .iter()
+            .zip(&w1)
+            .map(|(it, &w)| {
+                let slot = Slot { u0: u, w, center: u + w / 2.0, size: self.base_size(it) * it.mag * it.appear };
+                u += w;
+                slot
+            })
+            .collect();
+        // Each slot already has half a gap either side of its icon.
+        let edge = m.pad_main - m.gap / 2.0;
+        let bar = if l1 <= 0.0 {
+            (center - m.icon / 2.0 - m.pad_main, center + m.icon / 2.0 + m.pad_main)
+        } else {
+            (start - edge, start + l1 + edge)
+        };
+        Layout { slots, bar }
+    }
+
+    fn slide_distance(&self) -> f32 {
+        self.hide * (self.m.margin + self.m.thick + 4.0 * self.m.s)
+    }
+
+    /// Cursor position in dock coordinates, compensating for the auto-hide slide.
+    fn cursor_uv(&self) -> Option<(f32, f32)> {
+        let (x, y) = self.cursor?;
+        let (dx, dy) = self.axis.toward_edge(self.slide_distance());
+        Some(self.axis.uv(x - dx, y - dy))
+    }
+
+    fn lift(&self, it: &Item) -> f32 {
+        it.bounce.map_or(0.0, |t| (PI * t / BOUNCE_PERIOD).sin().abs() * self.m.bounce)
+    }
+
+    fn icon_uv(&self, i: usize) -> Option<(f32, f32, f32, f32)> {
+        let (it, s) = (self.items.get(i)?, self.layout.slots.get(i)?);
+        let cu = s.center + it.shift;
+        let v0 = self.m.margin + self.m.pad_cross + self.lift(it);
+        Some((cu - s.size / 2.0, cu + s.size / 2.0, v0, v0 + s.size))
+    }
+
+    fn hovering(&self) -> bool {
+        let Some((u, v)) = self.cursor_uv() else { return false };
+        if self.drag.as_ref().is_some_and(|d| !d.removing) {
+            return true;
+        }
+        let (b0, b1) = self.layout.bar;
+        if u >= b0 && u <= b1 && v <= self.m.margin + self.m.thick {
+            return true;
+        }
+        (0..self.items.len()).any(|i| {
+            self.icon_uv(i).is_some_and(|(u0, u1, v0, v1)| u >= u0 && u <= u1 && v >= v0 && v <= v1)
+        })
+    }
+
+    fn hovered_index(&self) -> Option<usize> {
+        if !self.hovering() {
+            return None;
+        }
+        let (u, _) = self.cursor_uv()?;
+        self.layout
+            .slots
+            .iter()
+            .zip(&self.items)
+            .position(|(s, it)| it.interactive() && u >= s.u0 && u < s.u0 + s.w)
+    }
+
+    // ------------------------------------------------------------ animation
+
+    fn frame(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f32().min(0.05);
+        self.last = now;
+        self.dirty = false;
+        let speed = if self.cfg.animation.enabled { self.cfg.animation.speed } else { 1000.0 };
+        let k = |rate: f32| 1.0 - (-dt * rate * speed).exp();
+        let mut moving = approach(&mut self.hide, self.hide_target, k(9.0), 0.002);
+
+        let removing = self.drag.as_ref().filter(|d| d.removing).map(|d| d.id.clone());
+        for it in &mut self.items {
+            let target = if it.dying || removing.as_deref() == Some(it.id.as_str()) { 0.0 } else { 1.0 };
+            moving |= approach(&mut it.appear, target, k(12.0), 0.002);
+            moving |= approach(&mut it.shift, 0.0, k(14.0), 0.1);
+            if let Some(t) = &mut it.bounce {
+                *t += dt * self.cfg.animation.speed;
+                if *t >= it.bounce_end {
+                    it.bounce = None;
+                }
+                moving = true;
+            }
+        }
+        self.items.retain(|it| !(it.dying && it.appear <= 0.0));
+
+        let hovering = self.hovering();
+        if hovering
+            && let Some((u, _)) = self.cursor_uv() {
+                self.anchor = u;
+            }
+        let targets = self.magnification_targets(hovering);
+        for (it, t) in self.items.iter_mut().zip(targets) {
+            moving |= approach(&mut it.mag, t, k(16.0), 0.001);
+        }
+        if let Some((_, until)) = &self.notice
+            && Instant::now() >= *until {
+                self.notice = None;
+            }
+
+        self.layout = self.compute_layout();
+        self.render();
+        self.animating = moving;
+    }
+
+    fn magnification_targets(&self, hovering: bool) -> Vec<f32> {
+        let m = &self.m;
+        let (cu, ok) = match self.cursor_uv() {
+            Some((u, _)) if hovering && m.mag > 1.0 => (u, true),
+            _ => (0.0, false),
+        };
+        // Distances are measured on the unmagnified layout so the effect doesn't feed back on itself.
+        let total: f32 = self.items.iter().map(|it| it.appear * (self.base_size(it) + m.gap)).sum();
+        let mut u = self.axis.main() / 2.0 - total / 2.0;
+        self.items
+            .iter()
+            .map(|it| {
+                let w = it.appear * (self.base_size(it) + m.gap);
+                let center = u + w / 2.0;
+                u += w;
+                if !ok || it.kind == Kind::Separator {
+                    return 1.0;
+                }
+                let d = (cu - center).abs() / (m.icon + m.gap);
+                let f = if d < m.range { 0.5 * (1.0 + (PI * d / m.range).cos()) } else { 0.0 };
+                1.0 + (m.mag - 1.0) * f
+            })
+            .collect()
+    }
+
+    fn render(&mut self) {
+        let m = self.m;
+        let ax = self.axis;
+        let pal = self.palette;
+        let offset = ax.toward_edge(self.slide_distance());
+        let (b0, b1) = self.layout.bar;
+        let bar = ax.rect(b0, b1, m.margin, m.margin + m.thick);
+        let mut region = vec![ax.rect(b0, b1, 0.0, m.margin + m.thick)];
+
+        // Label: the hovered app's name, or a notice (e.g. a config error).
+        let hovered = self.hovered_index().filter(|_| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open);
+        let label_req = match (&self.notice, hovered) {
+            (Some((text, _)), _) => Some((text.clone(), (b0 + b1) / 2.0, m.margin + m.thick)),
+            (None, Some(i)) => self.icon_uv(i).map(|(u0, u1, _, v1)| (self.items[i].name.clone(), (u0 + u1) / 2.0, v1)),
+            _ => None,
+        };
+        let label = label_req.and_then(|(text, cu, top)| {
+            let (tw, th) = self.renderer.as_mut()?.measure_label(&text)?;
+            let pad = (10.0 * m.s, 4.0 * m.s);
+            let (pw, ph) = (tw + 2.0 * pad.0, th + 2.0 * pad.1);
+            let v0 = top + 8.0 * m.s;
+            let rect = if ax.horizontal() {
+                let u0 = (cu - pw / 2.0).clamp(4.0 * m.s, (ax.main() - pw - 4.0 * m.s).max(0.0));
+                ax.rect(u0, u0 + pw, v0, v0 + ph)
+            } else {
+                ax.rect(cu - ph / 2.0, cu + ph / 2.0, v0, v0 + pw)
+            };
+            region.push(rect);
+            Some(LabelDraw { rect, text, bg: pal.label_bg, fg: pal.label_text, pad })
+        });
+
+        let mut shapes = Vec::new();
+        let mut icons = Vec::new();
+        let drag_id = self.drag.as_ref().map(|d| d.id.as_str());
+        for (i, it) in self.items.iter().enumerate() {
+            let Some(slot) = self.layout.slots.get(i) else { continue };
+            let cu = slot.center + it.shift;
+            if it.kind == Kind::Separator {
+                let t = m.s.max(1.0);
+                shapes.push(Shape {
+                    rect: ax.rect(cu - t / 2.0, cu + t / 2.0, m.margin + m.pad_cross + m.icon * 0.15, m.margin + m.pad_cross + m.icon * 0.85),
+                    radius: t / 2.0,
+                    color: pal.separator.alpha(it.appear),
+                });
+                continue;
+            }
+            if drag_id != Some(it.id.as_str())
+                && let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
+                    let rect = ax.rect(u0, u1, v0, v1);
+                    region.push(rect);
+                    icons.push(IconDraw { rect, source: &it.icon, opacity: it.appear.min(1.0) });
+                }
+            if it.windows.is_empty() || self.cfg.appearance.indicator == IndicatorStyle::None {
+                continue;
+            }
+            let active = it.windows.contains(&self.fg);
+            let col = if it.windows.iter().any(|w| self.attention.contains(w)) {
+                pal.attention
+            } else if active {
+                pal.active
+            } else {
+                pal.indicator
+            };
+            let vc = m.margin + m.pad_cross * 0.45;
+            match self.cfg.appearance.indicator {
+                IndicatorStyle::Dot => {
+                    let d = (m.icon * 0.08).max(3.0 * m.s);
+                    let n = it.windows.len().min(3);
+                    for k in 0..n {
+                        let uc = cu + (k as f32 - (n - 1) as f32 / 2.0) * d * 1.9;
+                        shapes.push(Shape { rect: ax.rect(uc - d / 2.0, uc + d / 2.0, vc - d / 2.0, vc + d / 2.0), radius: d / 2.0, color: col });
+                    }
+                }
+                _ => {
+                    let len = m.icon * if active { 0.42 } else { 0.2 };
+                    let t = 3.0 * m.s;
+                    shapes.push(Shape { rect: ax.rect(cu - len / 2.0, cu + len / 2.0, vc - t / 2.0, vc + t / 2.0), radius: t / 2.0, color: col });
+                }
+            }
+        }
+        // The icon being dragged follows the cursor.
+        if let (Some(d), Some((x, y))) = (&self.drag, self.cursor)
+            && let Some(it) = self.items.iter().find(|it| it.id == d.id) {
+                let size = m.icon * if d.removing { 1.0 } else { it.mag };
+                let rect = RectF { l: x - size / 2.0, t: y - size / 2.0, r: x + size / 2.0, b: y + size / 2.0 };
+                icons.push(IconDraw { rect, source: &it.icon, opacity: if d.removing { 0.5 } else { 0.92 } });
+            }
+
+        let frame = Frame {
+            offset,
+            bar,
+            bar_radius: m.radius,
+            bar_fill: pal.background,
+            bar_border: pal.border,
+            blur: self.blur,
+            placeholder: pal.placeholder,
+            shapes,
+            icons,
+            label,
+        };
+        if let Some(r) = &mut self.renderer {
+            match r.draw(&frame, &self.icons) {
+                Ok(()) => self.render_failures = 0,
+                Err(e) => {
+                    crate::log!("draw failed: {e}; recreating renderer");
+                    self.renderer = None;
+                    self.render_failures += 1;
+                }
+            }
+        }
+        drop(frame);
+        // e.g. the GPU was reset; retry a few times rather than spinning forever.
+        if self.renderer.is_none() && self.render_failures < 5 {
+            self.recreate_renderer();
+        }
+        self.update_region(region, offset);
+    }
+
+    fn recreate_renderer(&mut self) {
+        match Renderer::new(self.hwnd, self.axis.w as u32, self.axis.h as u32, self.cfg.dock.gpu) {
+            Ok(mut r) => {
+                r.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * self.m.s);
+                self.renderer = Some(r);
+                self.dirty = true;
+            }
+            Err(e) => crate::log!("renderer init failed: {e}"),
+        }
+    }
+
+    /// Only the visible parts of the dock take mouse input; the rest of the window is click-through.
+    fn update_region(&mut self, rects: Vec<RectF>, offset: (f32, f32)) {
+        let ax = self.axis;
+        let to_rect = |r: RectF| RECT { left: r.l.floor() as i32, top: r.t.floor() as i32, right: r.r.ceil() as i32, bottom: r.b.ceil() as i32 };
+        let list: Vec<RECT> = if self.drag.is_some() || self.press.is_some() {
+            vec![RECT { left: 0, top: 0, right: ax.w as i32, bottom: ax.h as i32 }]
+        } else if self.cfg.dock.autohide && self.hide_target >= 1.0 && self.hide > 0.95 {
+            // Fully hidden: a thin strip along the screen edge to reveal it.
+            let (b0, b1) = self.layout.bar;
+            vec![to_rect(ax.rect(b0, b1, 0.0, (2.0 * self.m.s).max(2.0)))]
+        } else {
+            rects.into_iter().map(|r| to_rect(r.translate(offset.0, offset.1).inflate(1.0))).collect()
+        };
+        if list == self.region {
+            return;
+        }
+        unsafe {
+            let rgn = CreateRectRgn(0, 0, 0, 0);
+            for r in &list {
+                let part = CreateRectRgn(r.left, r.top, r.right, r.bottom);
+                CombineRgn(Some(rgn), Some(rgn), Some(part), RGN_OR);
+                let _ = DeleteObject(part.into());
+            }
+            SetWindowRgn(self.hwnd, Some(rgn), true);
+        }
+        self.region = list;
+    }
+
+    // ---------------------------------------------------------------- input
+
+    fn track_leave(&mut self) {
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        self.tracking = true;
+    }
+
+    fn schedule_hide(&self, ms: u32) {
+        if self.cfg.dock.autohide {
+            self.set_timer(TIMER_HIDE, ms.max(1));
+        }
+    }
+
+    fn on_move(&mut self, x: f32, y: f32) {
+        self.cursor = Some((x, y));
+        if !self.tracking {
+            self.track_leave();
+        }
+        self.kill_timer(TIMER_HIDE);
+        self.hide_target = 0.0;
+        if let Some(p) = &self.press {
+            let moved = (x - p.x).hypot(y - p.y) > 6.0 * self.m.s;
+            if self.drag.is_none() && moved {
+                let pinned = p.id.as_ref().and_then(|id| self.items.iter().find(|it| &it.id == id && matches!(it.kind, Kind::Pinned(_))));
+                if let Some(it) = pinned {
+                    self.drag = Some(Drag { id: it.id.clone(), original: self.cfg.pinned.clone(), removing: false });
+                }
+            }
+        }
+        if self.drag.is_some() {
+            self.drag_update();
+        }
+        self.dirty = true;
+    }
+
+    fn on_leave(&mut self) {
+        self.tracking = false;
+        if self.press.is_some() || self.drag.is_some() || self.menu_open {
+            return;
+        }
+        self.cursor = None;
+        self.schedule_hide(self.cfg.dock.autohide_delay_ms);
+        self.dirty = true;
+    }
+
+    fn on_down(&mut self, x: f32, y: f32) {
+        self.cursor = Some((x, y));
+        let id = self.hovered_index().map(|i| self.items[i].id.clone());
+        self.press = Some(Press { id, x, y });
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+    }
+
+    fn on_up(&mut self, x: f32, y: f32) {
+        self.cursor = Some((x, y));
+        let press = self.press.take();
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if self.drag.is_some() {
+            self.finish_drag();
+        } else if let Some(id) = press.and_then(|p| p.id)
+            && let Some(i) = self.hovered_index().filter(|&i| self.items[i].id == id) {
+                self.click(i);
+            }
+        // Re-arm leave tracking; it reports right away if the cursor is already outside.
+        self.track_leave();
+        self.dirty = true;
+    }
+
+    fn click(&mut self, i: usize) {
+        let wins = self.items[i].windows.clone();
+        if wins.is_empty() {
+            self.launch(i);
+            return;
+        }
+        let fg = apps::foreground().0 as isize;
+        if let Some(p) = wins.iter().position(|&w| w == fg) {
+            if wins.len() > 1 {
+                apps::activate(HWND(wins[(p + 1) % wins.len()] as _));
+            } else if self.cfg.dock.click_minimizes {
+                apps::minimize(HWND(fg as _));
+            }
+        } else {
+            // Bring back the one used most recently (highest in z-order).
+            let best = self.windows.iter().map(|(h, _)| *h).find(|h| wins.contains(h)).unwrap_or(wins[0]);
+            apps::activate(HWND(best as _));
+        }
+    }
+
+    fn launch(&mut self, i: usize) {
+        let Some(l) = self.items[i].launch.clone() else { return };
+        if shell::launch(&l.path, l.args.as_deref(), l.cwd.as_deref()) && self.cfg.animation.bounce_on_launch {
+            let it = &mut self.items[i];
+            it.bounce = Some(0.0);
+            it.bounce_end = BOUNCE_PERIOD * 3.0;
+            self.dirty = true;
+        }
+    }
+
+    fn pinned_index(&self, id: &str) -> Option<usize> {
+        self.items.iter().find(|it| it.id == id).and_then(|it| match it.kind {
+            Kind::Pinned(i) => Some(i),
+            _ => None,
+        })
+    }
+
+    fn drag_update(&mut self) {
+        let (Some((x, y)), Some(d)) = (self.cursor, &self.drag) else { return };
+        let id = d.id.clone();
+        let (u, v) = self.axis.uv(x, y);
+        let m = self.m;
+        let removing = v > m.margin + m.thick + m.icon * 1.2 || v < -m.icon || u < 0.0 || u > self.axis.main();
+        if let Some(d) = &mut self.drag {
+            d.removing = removing;
+        }
+        let Some(from) = self.pinned_index(&id) else { return };
+        if removing {
+            return;
+        }
+        // Drop target: the pinned slot whose centre is closest to the cursor.
+        let target = self
+            .items
+            .iter()
+            .zip(&self.layout.slots)
+            .filter_map(|(it, s)| match it.kind {
+                Kind::Pinned(j) if !it.dying => Some((j, (s.center - u).abs())),
+                _ => None,
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(j, _)| j)
+            .unwrap_or(from);
+        if target == from {
+            return;
+        }
+        let width = self
+            .items
+            .iter()
+            .position(|it| it.id == id)
+            .and_then(|i| self.layout.slots.get(i))
+            .map_or(m.icon + m.gap, |s| s.w);
+        // Items the dragged icon passes over slide out of its way.
+        let (range, shift) = if target > from { (from + 1..=target, width) } else { (target..=from - 1, -width) };
+        let moved: Vec<String> = self
+            .items
+            .iter()
+            .filter(|it| matches!(it.kind, Kind::Pinned(j) if range.contains(&j)) && !it.dying)
+            .map(|it| it.id.clone())
+            .collect();
+        let p = self.cfg.pinned.remove(from);
+        self.cfg.pinned.insert(target, p);
+        self.rebuild_items();
+        for it in &mut self.items {
+            if moved.contains(&it.id) {
+                it.shift += shift;
+            }
+        }
+    }
+
+    fn finish_drag(&mut self) {
+        let Some(d) = self.drag.take() else { return };
+        if d.removing
+            && let Some(i) = self.pinned_index(&d.id) {
+                self.cfg.pinned.remove(i);
+            }
+        if self.cfg.pinned != d.original {
+            self.save_pins();
+        }
+        self.rebuild_items();
+    }
+
+    fn cancel_drag(&mut self) {
+        if let Some(d) = self.drag.take() {
+            self.cfg.pinned = d.original;
+            self.press = None;
+            self.rebuild_items();
+        }
+    }
+
+    fn on_drop(&mut self, hdrop: HDROP) {
+        let mut paths = Vec::new();
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = DragQueryPoint(hdrop, &mut pt);
+            let n = DragQueryFileW(hdrop, u32::MAX, None);
+            for i in 0..n {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                DragQueryFileW(hdrop, i, Some(&mut buf));
+                paths.push(from_wide(&buf));
+            }
+            DragFinish(hdrop);
+        }
+        let (dx, dy) = self.axis.toward_edge(self.slide_distance());
+        let (u, _) = self.axis.uv(pt.x as f32 - dx, pt.y as f32 - dy);
+        let mut at = self
+            .items
+            .iter()
+            .zip(&self.layout.slots)
+            .filter(|(it, s)| matches!(it.kind, Kind::Pinned(_)) && !it.dying && s.center < u)
+            .count();
+        let mut added = false;
+        for path in paths {
+            if self.cfg.pinned.iter().any(|p| p.path.eq_ignore_ascii_case(&path)) {
+                continue;
+            }
+            self.cfg.pinned.insert(at.min(self.cfg.pinned.len()), Pinned { path, ..Default::default() });
+            at += 1;
+            added = true;
+        }
+        if added {
+            self.save_pins();
+            self.rebuild_items();
+        }
+    }
+
+    // ----------------------------------------------------------------- menu
+
+    fn menu_spec(&mut self, x: f32, y: f32) -> MenuSpec {
+        self.cursor = Some((x, y));
+        let idx = self.hovered_index();
+        let mut entries: Vec<(u32, String)> = Vec::new();
+        if let Some(it) = idx.map(|i| &self.items[i]) {
+            if it.launch.is_some() {
+                entries.push((CMD_OPEN, if it.windows.is_empty() { "Open" } else { "New window" }.into()));
+            }
+            match it.kind {
+                Kind::Pinned(_) => entries.push((CMD_UNPIN, "Remove from dock".into())),
+                Kind::Running if it.launch.is_some() => entries.push((CMD_PIN, "Keep in dock".into())),
+                _ => {}
+            }
+            match it.windows.len() {
+                0 => {}
+                1 => entries.push((CMD_CLOSE, "Close window".into())),
+                n => entries.push((CMD_CLOSE, format!("Close all {n} windows"))),
+            }
+            entries.push((0, String::new()));
+        }
+        entries.push((CMD_IMPORT, "Import taskbar pins".into()));
+        entries.push((CMD_SETTINGS, "Dock settings…".into()));
+        entries.push((CMD_QUIT, "Quit Windock".into()));
+        self.menu_open = true;
+        self.dirty = true;
+        let align = match self.cfg.dock.position {
+            Position::Bottom => TPM_BOTTOMALIGN | TPM_CENTERALIGN,
+            Position::Top => TPM_TOPALIGN | TPM_CENTERALIGN,
+            Position::Left => TPM_LEFTALIGN | TPM_VCENTERALIGN,
+            Position::Right => TPM_RIGHTALIGN | TPM_VCENTERALIGN,
+        };
+        MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, align }
+    }
+
+    fn menu_command(&mut self, spec: &MenuSpec, cmd: u32) {
+        self.menu_open = false;
+        self.cursor = None;
+        self.tracking = false;
+        self.dirty = true;
+        let idx = spec.item.as_ref().and_then(|id| self.items.iter().position(|it| &it.id == id && !it.dying));
+        match (cmd, idx) {
+            (CMD_OPEN, Some(i)) => self.launch(i),
+            (CMD_PIN, Some(i)) => {
+                if let Some(l) = self.items[i].launch.clone() {
+                    self.cfg.pinned.push(Pinned { path: l.path, ..Default::default() });
+                    self.save_pins();
+                    self.rebuild_items();
+                }
+            }
+            (CMD_UNPIN, Some(i)) => {
+                if let Kind::Pinned(p) = self.items[i].kind {
+                    self.cfg.pinned.remove(p);
+                    self.save_pins();
+                    self.rebuild_items();
+                }
+            }
+            (CMD_CLOSE, Some(i)) => self.items[i].windows.iter().for_each(|&w| apps::close(HWND(w as _))),
+            (CMD_IMPORT, _) => {
+                let text = match self.import_taskbar_pins() {
+                    0 => "Everything pinned to the taskbar is already here".to_string(),
+                    1 => "Added 1 app from the taskbar".to_string(),
+                    n => format!("Added {n} apps from the taskbar"),
+                };
+                self.show_notice(text, INFO_TIME);
+            }
+            (CMD_SETTINGS, _) => open_settings(),
+            (CMD_QUIT, _) => unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            },
+            _ => {}
+        }
+        self.schedule_hide(self.cfg.dock.autohide_delay_ms);
+    }
+
+    // -------------------------------------------------------------- messages
+
+    fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let x = (lp.0 & 0xffff) as i16 as f32;
+        let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
+        match msg {
+            WM_MOUSEMOVE => self.on_move(x, y),
+            WM_MOUSELEAVE => self.on_leave(),
+            WM_LBUTTONDOWN => self.on_down(x, y),
+            WM_LBUTTONUP => self.on_up(x, y),
+            WM_MBUTTONUP => {
+                self.cursor = Some((x, y));
+                if let Some(i) = self.hovered_index() {
+                    self.launch(i);
+                }
+            }
+            WM_CAPTURECHANGED => {
+                if lp.0 != self.hwnd.0 as isize && self.drag.is_some() {
+                    self.cancel_drag();
+                }
+            }
+            WM_MOUSEACTIVATE => return Some(LRESULT(MA_NOACTIVATE as isize)),
+            WM_DROPFILES => self.on_drop(HDROP(wp.0 as _)),
+            WM_TIMER => {
+                self.kill_timer(wp.0);
+                match wp.0 {
+                    TIMER_REFRESH => self.refresh_windows(),
+                    TIMER_CONFIG => self.reload_config(),
+                    TIMER_HIDE => {
+                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() {
+                            self.hide_target = 1.0;
+                            self.dirty = true;
+                        }
+                    }
+                    TIMER_NOTICE => {
+                        self.notice = None;
+                        self.dirty = true;
+                        self.schedule_hide(self.cfg.dock.autohide_delay_ms);
+                    }
+                    _ => {}
+                }
+            }
+            WM_APP_REFRESH => self.set_timer(TIMER_REFRESH, 60),
+            WM_APP_CONFIG => self.set_timer(TIMER_CONFIG, 150),
+            WM_APP_ICONS => self.take_icons(),
+            WM_APP_FOREGROUND => {
+                let h = wp.0 as isize;
+                self.fg = h;
+                self.attention.remove(&h);
+                if !self.windows.iter().any(|(w, _)| *w == h) {
+                    self.set_timer(TIMER_REFRESH, 60);
+                }
+                self.check_fullscreen();
+                self.dirty = true;
+            }
+            WM_APP_APPBAR => match wp.0 as u32 {
+                ABN_POSCHANGED => self.place(),
+                ABN_FULLSCREENAPP => self.check_fullscreen(),
+                _ => {}
+            },
+            WM_DISPLAYCHANGE | WM_DPICHANGED => self.place(),
+            WM_SETTINGCHANGE => {
+                if wp.0 as u32 == SPI_SETWORKAREA.0 {
+                    self.place();
+                } else if lp.0 != 0 && unsafe { PCWSTR(lp.0 as _).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet") {
+                    self.apply_theme();
+                }
+                return None;
+            }
+            WM_PAINT => unsafe {
+                let _ = ValidateRect(Some(self.hwnd), None);
+                self.dirty = true;
+            },
+            WM_ERASEBKGND => return Some(LRESULT(1)),
+            WM_DESTROY => unsafe { PostQuitMessage(0) },
+            m if m != 0 && m == SHELLHOOK_MSG.load(Ordering::Relaxed) => match wp.0 as u32 {
+                HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED => self.set_timer(TIMER_REFRESH, 60),
+                HSHELL_FLASH => {
+                    let h = lp.0;
+                    if self.attention.insert(h) && self.cfg.animation.bounce_on_launch
+                        && let Some(it) = self.items.iter_mut().find(|it| it.windows.contains(&h)) {
+                            it.bounce = Some(0.0);
+                            it.bounce_end = BOUNCE_PERIOD * 2.0;
+                        }
+                    self.dirty = true;
+                }
+                _ => {}
+            },
+            m if m != 0 && m == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) => {
+                // Explorer restarted: our app bar registration is gone.
+                self.reserved = None;
+                unsafe {
+                    let _ = RegisterShellHookWindow(self.hwnd);
+                }
+                self.appbar_register();
+                self.place();
+            }
+            _ => return None,
+        }
+        Some(LRESULT(0))
+    }
+}
+
+/// The settings window runs as a separate process so the dock stays lean.
+fn open_settings() {
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn()) {
+        Ok(_) => {}
+        Err(e) => crate::log!("couldn't open settings: {e}"),
+    }
+}
+
+fn config_error(e: &str) -> String {
+    format!("Config error: {}", e.lines().next().unwrap_or(e))
+}
+
+/// All monitors, left to right (the order `monitor = N` in the config refers to).
+pub(crate) fn monitors() -> Vec<(HMONITOR, MONITORINFO)> {
+    unsafe extern "system" fn cb(h: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+        unsafe { (*(lp.0 as *mut Vec<HMONITOR>)).push(h) };
+        true.into()
+    }
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut handles as *mut _ as isize));
+    }
+    let mut out: Vec<(HMONITOR, MONITORINFO)> = handles
+        .into_iter()
+        .filter_map(|h| {
+            let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            unsafe { GetMonitorInfoW(h, &mut mi) }.as_bool().then_some((h, mi))
+        })
+        .collect();
+    out.sort_by_key(|(_, mi)| (mi.rcMonitor.left, mi.rcMonitor.top));
+    out
+}
+
+/// Posts a message whenever a file in the config folder changes.
+fn watch_config(dir: PathBuf) {
+    std::thread::spawn(move || unsafe {
+        let Ok(handle) = FindFirstChangeNotificationW(
+            &HSTRING::from(dir.as_os_str()),
+            false,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
+        ) else {
+            crate::log!("cannot watch {}", dir.display());
+            return;
+        };
+        while WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0 {
+            post(WM_APP_CONFIG, 0);
+            if FindNextChangeNotification(handle).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
+    if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 || hwnd.is_invalid() {
+        return;
+    }
+    let id = hwnd.0 as isize;
+    let tracked = TRACKED.with(|t| t.borrow().contains(&id));
+    match event {
+        EVENT_SYSTEM_FOREGROUND => post(WM_APP_FOREGROUND, id as usize),
+        EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED if tracked => post(WM_APP_REFRESH, 0),
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED | EVENT_OBJECT_NAMECHANGE if !tracked => unsafe {
+            if GetAncestor(hwnd, GA_ROOT) == hwnd && IsWindowVisible(hwnd).as_bool() {
+                post(WM_APP_REFRESH, 0);
+            }
+        },
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_RBUTTONUP {
+        let (x, y) = ((lp.0 & 0xffff) as i16 as f32, ((lp.0 >> 16) & 0xffff) as i16 as f32);
+        // The menu runs its own message loop, so the app must not stay borrowed while it's open.
+        if let Some(spec) = with_app(|a| a.menu_spec(x, y)) {
+            let cmd = unsafe { show_menu(hwnd, &spec) };
+            with_app(|a| a.menu_command(&spec, cmd));
+        }
+        return LRESULT(0);
+    }
+    if let Some(Some(r)) = with_app(|a| a.handle(msg, wp, lp)) {
+        return r;
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+unsafe fn show_menu(hwnd: HWND, spec: &MenuSpec) -> u32 {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        for (id, label) in &spec.entries {
+            if *id == 0 {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            } else {
+                let text = wide(label);
+                let _ = AppendMenuW(menu, MF_STRING, *id as usize, PCWSTR(text.as_ptr()));
+            }
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | spec.align, pt.x, pt.y, None, hwnd, None);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        cmd.0 as u32
+    }
+}
+
+pub fn run() -> Result<()> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class = w!("WindockDock");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        let hwnd = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_ACCEPTFILES,
+            class,
+            w!("Windock"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        DOCK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        // Windows.UI.Composition needs a dispatcher queue on the UI thread.
+        let _queue = CreateDispatcherQueueController(DispatcherQueueOptions {
+            dwSize: size_of::<DispatcherQueueOptions>() as u32,
+            threadType: DQTYPE_THREAD_CURRENT,
+            apartmentType: DQTAT_COM_NONE,
+        })?;
+        let app = App::new(hwnd);
+        APP.with(|a| *a.borrow_mut() = Some(app));
+        with_app(|a| a.start());
+        message_loop();
+        with_app(|a| a.shutdown());
+        APP.with(|a| a.borrow_mut().take());
+    }
+    Ok(())
+}
+
+/// Blocks in GetMessage while idle; while animating, renders once per display refresh.
+fn message_loop() {
+    let mut msg = MSG::default();
+    unsafe {
+        loop {
+            if with_app(|a| a.wants_frame()).unwrap_or(false) {
+                with_app(|a| a.frame());
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if DwmFlush().is_err() {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            } else {
+                if GetMessageW(&mut msg, None, 0, 0).0 <= 0 {
+                    return;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}

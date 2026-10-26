@@ -1,0 +1,228 @@
+//! Thin wrappers over Win32 shell, registry and theme APIs.
+
+use crate::util::{from_wide, wide};
+use std::ffi::c_void;
+use std::path::Path;
+use windows::Win32::Foundation::*;
+use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Registry::*;
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{HSTRING, PCSTR, PCWSTR, w};
+
+pub const APPS_FOLDER: &str = r"shell:AppsFolder\";
+
+pub fn apps_folder_aumid(path: &str) -> Option<&str> {
+    let n = APPS_FOLDER.len();
+    (path.len() > n && path[..n].eq_ignore_ascii_case(APPS_FOLDER)).then(|| &path[n..])
+}
+
+/// Expands `%VARIABLES%` in a path.
+pub fn expand_env(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let src = wide(s);
+    let mut buf = vec![0u16; 2048];
+    let n = unsafe { windows::Win32::System::Environment::ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut buf)) };
+    if n == 0 || n as usize > buf.len() {
+        return s.to_string();
+    }
+    from_wide(&buf)
+}
+
+pub fn launch(path: &str, args: Option<&str>, cwd: Option<&str>) -> bool {
+    let file = wide(path);
+    let params = args.filter(|a| !a.is_empty()).map(wide);
+    // Default the working directory to the program's folder, like Explorer does.
+    let dir = cwd.map(str::to_owned).or_else(|| {
+        let p = Path::new(path);
+        (apps_folder_aumid(path).is_none() && p.is_file())
+            .then(|| p.parent().map(|d| d.to_string_lossy().into_owned()))
+            .flatten()
+    });
+    let dir = dir.map(|d| wide(&d));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: params.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
+        lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    let ok = unsafe { ShellExecuteExW(&mut info) }.is_ok();
+    if !ok {
+        crate::log!("launch failed: {path}");
+    }
+    ok
+}
+
+/// Opens a file for editing, falling back to Notepad when nothing is associated.
+pub fn edit_file(path: &Path) {
+    let p = path.to_string_lossy();
+    let file = wide(&p);
+    let r = unsafe { ShellExecuteW(None, w!("open"), PCWSTR(file.as_ptr()), None, None, SW_SHOWNORMAL) };
+    if r.0 as isize <= 32 {
+        launch("notepad.exe", Some(&format!("\"{p}\"")), None);
+    }
+}
+
+/// Target path and AppUserModelID of a .lnk shortcut.
+pub fn resolve_lnk(path: &str) -> (Option<String>, Option<String>) {
+    unsafe {
+        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else {
+            return (None, None);
+        };
+        let Ok(file) = windows::core::Interface::cast::<IPersistFile>(&link) else {
+            return (None, None);
+        };
+        if file.Load(&HSTRING::from(path), STGM_READ).is_err() {
+            return (None, None);
+        }
+        let mut buf = [0u16; 1024];
+        let target = link
+            .GetPath(&mut buf, std::ptr::null_mut(), 0)
+            .ok()
+            .map(|_| from_wide(&buf))
+            .filter(|s| !s.is_empty());
+        let aumid = windows::core::Interface::cast::<IPropertyStore>(&link)
+            .ok()
+            .and_then(|store| store.GetValue(&PKEY_AppUserModel_ID).ok())
+            .map(|v| v.to_string())
+            .filter(|s| !s.is_empty());
+        (target, aumid)
+    }
+}
+
+/// "FileDescription" from an executable's version resource, e.g. "Microsoft Edge".
+pub fn file_description(path: &str) -> Option<String> {
+    unsafe {
+        let p = HSTRING::from(path);
+        let size = GetFileVersionInfoSizeW(&p, None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(&p, None, size, data.as_mut_ptr() as *mut c_void).ok()?;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        let mut langs = vec![(0x0409u16, 0x04b0u16)];
+        if VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool()
+            && len >= 4
+        {
+            let pairs = std::slice::from_raw_parts(ptr as *const u16, (len / 2) as usize);
+            langs = pairs.chunks_exact(2).map(|c| (c[0], c[1])).chain(langs).collect();
+        }
+        for (lang, cp) in langs {
+            let key = wide(&format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\FileDescription"));
+            if VerQueryValueW(data.as_ptr() as _, PCWSTR(key.as_ptr()), &mut ptr, &mut len).as_bool() && len > 1 {
+                let s = from_wide(std::slice::from_raw_parts(ptr as *const u16, len as usize));
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Display name the shell shows for a path or parsing name (e.g. a Store app in AppsFolder).
+pub fn display_name(parsing_name: &str) -> Option<String> {
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(parsing_name), None).ok()?;
+        let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let s = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as _));
+        s.filter(|s| !s.is_empty())
+    }
+}
+
+/// Friendly name for something the user pinned or that is running.
+pub fn friendly_name(path: &str) -> String {
+    let p = Path::new(path);
+    let is_exe = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if is_exe
+        && let Some(d) = file_description(path) {
+            return d;
+        }
+    if let Some(d) = display_name(path) {
+        return d;
+    }
+    p.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn reg_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
+    let mut data = 0u32;
+    let mut size = 4u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey,
+            value,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    (r == ERROR_SUCCESS).then_some(data)
+}
+
+const PERSONALIZE: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+
+pub fn system_dark_mode() -> bool {
+    reg_dword(PERSONALIZE, w!("AppsUseLightTheme")) == Some(0)
+}
+
+pub fn transparency_enabled() -> bool {
+    reg_dword(PERSONALIZE, w!("EnableTransparency")) != Some(0)
+}
+
+pub fn set_autostart(enabled: bool) {
+    let run = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    unsafe {
+        if enabled {
+            let Ok(exe) = std::env::current_exe() else { return };
+            let cmd = wide(&format!("\"{}\"", exe.display()));
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                run,
+                w!("Windock"),
+                REG_SZ.0,
+                Some(cmd.as_ptr() as *const c_void),
+                (cmd.len() * 2) as u32,
+            );
+        } else {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, run, w!("Windock"));
+        }
+    }
+}
+
+/// Makes Win32 popup menus follow the dark/light theme.
+/// Uses uxtheme's unnamed exports (SetPreferredAppMode=135, FlushMenuThemes=136), as Explorer does.
+pub fn set_menu_theme(mode: crate::config::Theme) {
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        let set_mode = GetProcAddress(ux, PCSTR(135 as *const u8));
+        let flush = GetProcAddress(ux, PCSTR(136 as *const u8));
+        if let (Some(set_mode), Some(flush)) = (set_mode, flush) {
+            let set_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+            let flush: extern "system" fn() = std::mem::transmute(flush);
+            set_mode(match mode {
+                crate::config::Theme::Auto => 1,
+                crate::config::Theme::Dark => 2,
+                crate::config::Theme::Light => 3,
+            });
+            flush();
+        }
+    }
+}
