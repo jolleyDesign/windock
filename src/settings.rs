@@ -224,6 +224,7 @@ impl Settings {
         c |= toggle(ui, &mut d.show_running, "Show running apps", "Includes apps that aren't pinned");
         c |= toggle(ui, &mut d.show_all_desktops, "All virtual desktops", "Clicking an app switches to its desktop");
         c |= toggle(ui, &mut d.show_labels, "Show app names", "On hover");
+        c |= toggle(ui, &mut d.previews, "Window previews", "Hover a running app to see its windows");
         c |= toggle(ui, &mut d.click_minimizes, "Click to minimize", "Clicking the focused app minimizes it");
 
         section(ui, "System");

@@ -112,6 +112,7 @@ pub struct Dock {
     pub show_running: bool,
     pub show_all_desktops: bool,
     pub show_labels: bool,
+    pub previews: bool,
     pub hide_on_fullscreen: bool,
     pub click_minimizes: bool,
     pub autostart: bool,
@@ -130,6 +131,7 @@ impl Default for Dock {
             show_running: true,
             show_all_desktops: false,
             show_labels: true,
+            previews: true,
             hide_on_fullscreen: true,
             click_minimizes: true,
             autostart: false,
@@ -516,6 +518,7 @@ always_on_top = true
 show_running = true          # also show running apps that aren't pinned
 show_all_desktops = false    # include apps on other virtual desktops
 show_labels = true           # show the app name while hovering
+previews = true              # live window previews when hovering a running app
 hide_on_fullscreen = true    # get out of the way of games and videos
 click_minimizes = true       # clicking the focused app minimizes it
 autostart = false            # start Windock when you sign in

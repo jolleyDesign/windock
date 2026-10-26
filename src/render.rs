@@ -1,5 +1,6 @@
 //! GPU rendering: Windows.UI.Composition hosts a host-backdrop (frosted glass) visual
-//! plus a Direct2D-drawn surface with the dock itself.
+//! plus a Direct2D-drawn surface for each window. One `Gpu` (device, text, icon cache)
+//! is shared by the dock and the preview popup; each has its own `Surface`.
 
 use crate::config::Color;
 use crate::icons::IconPixels;
@@ -14,8 +15,8 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM};
 use windows::Win32::System::WinRT::Composition::*;
 use windows::core::{HSTRING, Interface, Result, w};
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -29,6 +30,9 @@ pub struct RectF {
 }
 
 impl RectF {
+    pub fn new(l: f32, t: f32, w: f32, h: f32) -> RectF {
+        RectF { l, t, r: l + w, b: t + h }
+    }
     pub fn w(&self) -> f32 {
         self.r - self.l
     }
@@ -40,6 +44,9 @@ impl RectF {
     }
     pub fn inflate(&self, d: f32) -> RectF {
         RectF { l: self.l - d, t: self.t - d, r: self.r + d, b: self.b + d }
+    }
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.l && x < self.r && y >= self.t && y < self.b
     }
     fn d2d(&self) -> D2D_RECT_F {
         D2D_RECT_F { left: self.l, top: self.t, right: self.r, bottom: self.b }
@@ -59,16 +66,21 @@ pub struct IconDraw<'a> {
 }
 
 pub struct LabelDraw {
+    /// Background rectangle; the text starts `pad` inside it.
     pub rect: RectF,
+    pub radius: f32,
     pub text: String,
+    /// Wider text is trimmed with an ellipsis.
+    pub max_width: f32,
     pub bg: Color,
     pub fg: Color,
     pub pad: (f32, f32),
 }
 
 pub struct Frame<'a> {
-    /// Offset of the whole dock (used to slide it away when auto-hiding).
+    /// Offset of the whole window's content (used to slide the dock away when auto-hiding).
     pub offset: (f32, f32),
+    /// The frosted, bordered background.
     pub bar: RectF,
     pub bar_radius: f32,
     pub bar_fill: Color,
@@ -77,26 +89,48 @@ pub struct Frame<'a> {
     pub placeholder: Color,
     pub shapes: Vec<Shape>,
     pub icons: Vec<IconDraw<'a>>,
-    pub label: Option<LabelDraw>,
+    pub labels: Vec<LabelDraw>,
 }
 
-pub struct Renderer {
+/// The composition target and drawing surface for one window.
+pub struct Surface {
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     backdrop: SpriteVisual,
     backdrop_shape: CompositionRoundedRectangleGeometry,
     content: SpriteVisual,
-    _graphics: CompositionGraphicsDevice,
     surface: ICompositionDrawingSurfaceInterop,
+    size: (u32, u32),
+    /// Area drawn last frame; it must be cleared when content shrinks or moves.
+    drawn: Option<RECT>,
+}
+
+impl Surface {
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        let size = (width.max(1), height.max(1));
+        if size == self.size {
+            return Ok(());
+        }
+        self.size = size;
+        // Resizing discards the surface contents, so the next frame redraws everything.
+        self.drawn = Some(RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 });
+        unsafe {
+            self.surface.Resize(SIZE { cx: size.0 as i32, cy: size.1 as i32 })?;
+        }
+        self.content.SetSize(Vector2 { X: size.0 as f32, Y: size.1 as f32 })
+    }
+}
+
+/// Device-level state shared by every surface.
+pub struct Gpu {
+    compositor: Compositor,
+    graphics: CompositionGraphicsDevice,
     resources: ID2D1DeviceContext,
     brush: ID2D1SolidColorBrush,
     dwrite: IDWriteFactory,
     label_format: Option<IDWriteTextFormat>,
-    label_layout: Option<(String, IDWriteTextLayout, f32, f32)>,
+    layouts: HashMap<(String, u32), (IDWriteTextLayout, f32, f32)>,
     bitmaps: HashMap<String, ID2D1Bitmap1>,
-    size: (u32, u32),
-    /// Area drawn last frame; it must be cleared when the dock shrinks or moves.
-    drawn: Option<RECT>,
 }
 
 fn color(c: Color) -> D2D1_COLOR_F {
@@ -132,81 +166,72 @@ fn d3d_device(gpu: bool) -> Result<ID3D11Device> {
     last
 }
 
-impl Renderer {
+impl Gpu {
     /// Needs a DispatcherQueue on the calling thread.
-    pub fn new(hwnd: HWND, width: u32, height: u32, gpu: bool) -> Result<Self> {
+    pub fn new(gpu: bool) -> Result<Self> {
         unsafe {
             let compositor = Compositor::new()?;
-            let target = compositor
-                .cast::<ICompositorDesktopInterop>()?
-                .CreateDesktopWindowTarget(hwnd, true)?;
-            let root = compositor.CreateContainerVisual()?;
-            target.SetRoot(&root)?;
-
-            // Frosted glass: DWM's blurred view of whatever is behind the window,
-            // clipped to the dock's rounded rectangle.
-            let backdrop = compositor.CreateSpriteVisual()?;
-            backdrop.SetBrush(&compositor.CreateHostBackdropBrush()?)?;
-            let backdrop_shape = compositor.CreateRoundedRectangleGeometry()?;
-            backdrop.SetClip(&compositor.CreateGeometricClipWithGeometry(&backdrop_shape)?)?;
-            root.Children()?.InsertAtTop(&backdrop)?;
-
             let d3d = d3d_device(gpu)?;
             let dxgi: IDXGIDevice = d3d.cast()?;
             let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2d = factory.CreateDevice(&dxgi)?;
             let resources = d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             let brush = resources.CreateSolidColorBrush(&color(Color::rgba(0, 0, 0, 0)), None)?;
-
             let graphics = compositor.cast::<ICompositorInterop>()?.CreateGraphicsDevice(&d2d)?;
-            let surface = graphics.CreateDrawingSurface(
-                Size { Width: width.max(1) as f32, Height: height.max(1) as f32 },
+            Ok(Self {
+                compositor,
+                graphics,
+                resources,
+                brush,
+                dwrite: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
+                label_format: None,
+                layouts: HashMap::new(),
+                bitmaps: HashMap::new(),
+            })
+        }
+    }
+
+    pub fn create_surface(&self, hwnd: HWND, width: u32, height: u32) -> Result<Surface> {
+        let c = &self.compositor;
+        unsafe {
+            let target = c.cast::<ICompositorDesktopInterop>()?.CreateDesktopWindowTarget(hwnd, true)?;
+            let root = c.CreateContainerVisual()?;
+            target.SetRoot(&root)?;
+
+            // Frosted glass: DWM's blurred view of whatever is behind the window,
+            // clipped to the background's rounded rectangle.
+            let backdrop = c.CreateSpriteVisual()?;
+            backdrop.SetBrush(&c.CreateHostBackdropBrush()?)?;
+            let backdrop_shape = c.CreateRoundedRectangleGeometry()?;
+            backdrop.SetClip(&c.CreateGeometricClipWithGeometry(&backdrop_shape)?)?;
+            root.Children()?.InsertAtTop(&backdrop)?;
+
+            let (w, h) = (width.max(1), height.max(1));
+            let surface = self.graphics.CreateDrawingSurface(
+                Size { Width: w as f32, Height: h as f32 },
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 DirectXAlphaMode::Premultiplied,
             )?;
-            let content = compositor.CreateSpriteVisual()?;
-            content.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&surface)?)?;
-            content.SetSize(Vector2 { X: width as f32, Y: height as f32 })?;
+            let content = c.CreateSpriteVisual()?;
+            content.SetBrush(&c.CreateSurfaceBrushWithSurface(&surface)?)?;
+            content.SetSize(Vector2 { X: w as f32, Y: h as f32 })?;
             root.Children()?.InsertAtTop(&content)?;
 
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-
-            Ok(Self {
+            Ok(Surface {
                 _target: target,
                 root,
                 backdrop,
                 backdrop_shape,
                 content,
-                _graphics: graphics,
                 surface: surface.cast()?,
-                resources,
-                brush,
-                dwrite,
-                label_format: None,
-                label_layout: None,
-                bitmaps: HashMap::new(),
-                size: (width.max(1), height.max(1)),
-                drawn: Some(RECT { left: 0, top: 0, right: width.max(1) as i32, bottom: height.max(1) as i32 }),
+                size: (w, h),
+                drawn: Some(RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }),
             })
         }
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-        let size = (width.max(1), height.max(1));
-        if size == self.size {
-            return Ok(());
-        }
-        self.size = size;
-        // Resizing discards the surface contents, so the next frame redraws everything.
-        self.drawn = Some(RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 });
-        unsafe {
-            self.surface.Resize(SIZE { cx: size.0 as i32, cy: size.1 as i32 })?;
-        }
-        self.content.SetSize(Vector2 { X: size.0 as f32, Y: size.1 as f32 })
-    }
-
     pub fn set_label_font(&mut self, family: &str, size_px: f32) {
-        self.label_layout = None;
+        self.layouts.clear();
         self.label_format = unsafe {
             self.dwrite
                 .CreateTextFormat(
@@ -220,27 +245,37 @@ impl Renderer {
                 )
                 .inspect(|f| {
                     let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    if let Ok(ellipsis) = self.dwrite.CreateEllipsisTrimmingSign(f) {
+                        let trim = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+                        let _ = f.SetTrimming(&trim, &ellipsis);
+                    }
                 })
                 .ok()
         };
     }
 
-    /// Size of `text` in the label font, in pixels.
-    pub fn measure_label(&mut self, text: &str) -> Option<(f32, f32)> {
-        if let Some((t, _, w, h)) = &self.label_layout
-            && t == text {
-                return Some((*w, *h));
+    fn layout(&mut self, text: &str, max_width: f32) -> Option<&(IDWriteTextLayout, f32, f32)> {
+        let key = (text.to_string(), max_width.max(1.0) as u32);
+        if !self.layouts.contains_key(&key) {
+            if self.layouts.len() > 128 {
+                self.layouts.clear();
             }
-        let format = self.label_format.as_ref()?;
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            let layout = self.dwrite.CreateTextLayout(&utf16, format, 4000.0, 1000.0).ok()?;
-            let mut m = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut m).ok()?;
-            let (w, h) = (m.widthIncludingTrailingWhitespace.ceil(), m.height.ceil());
-            self.label_layout = Some((text.to_string(), layout, w, h));
-            Some((w, h))
+            let format = self.label_format.as_ref()?;
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            unsafe {
+                let layout = self.dwrite.CreateTextLayout(&utf16, format, key.1 as f32, 1000.0).ok()?;
+                let mut m = DWRITE_TEXT_METRICS::default();
+                layout.GetMetrics(&mut m).ok()?;
+                let w = m.widthIncludingTrailingWhitespace.min(key.1 as f32).ceil();
+                self.layouts.insert(key.clone(), (layout, w, m.height.ceil()));
+            }
         }
+        self.layouts.get(&key)
+    }
+
+    /// Size of `text` in the label font, in pixels, trimmed to `max_width`.
+    pub fn measure(&mut self, text: &str, max_width: f32) -> Option<(f32, f32)> {
+        self.layout(text, max_width).map(|(_, w, h)| (*w, *h))
     }
 
     pub fn clear_bitmaps(&mut self) {
@@ -273,19 +308,21 @@ impl Renderer {
         Some(bmp)
     }
 
-    pub fn draw(&mut self, f: &Frame, pixels: &HashMap<String, Option<IconPixels>>) -> Result<()> {
-        self.root.SetOffset(Vector3 { X: f.offset.0, Y: f.offset.1, Z: 0.0 })?;
+    pub fn draw(&mut self, s: &mut Surface, f: &Frame, pixels: &HashMap<String, Option<IconPixels>>) -> Result<()> {
+        s.root.SetOffset(Vector3 { X: f.offset.0, Y: f.offset.1, Z: 0.0 })?;
         let show_backdrop = f.blur && f.bar.w() > 0.0;
-        self.backdrop.SetIsVisible(show_backdrop)?;
+        s.backdrop.SetIsVisible(show_backdrop)?;
         if show_backdrop {
             let size = Vector2 { X: f.bar.w(), Y: f.bar.h() };
-            self.backdrop.SetOffset(Vector3 { X: f.bar.l, Y: f.bar.t, Z: 0.0 })?;
-            self.backdrop.SetSize(size)?;
-            self.backdrop_shape.SetSize(size)?;
-            self.backdrop_shape.SetCornerRadius(Vector2 { X: f.bar_radius, Y: f.bar_radius })?;
+            s.backdrop.SetOffset(Vector3 { X: f.bar.l, Y: f.bar.t, Z: 0.0 })?;
+            s.backdrop.SetSize(size)?;
+            s.backdrop_shape.SetSize(size)?;
+            s.backdrop_shape.SetCornerRadius(Vector2 { X: f.bar_radius, Y: f.bar_radius })?;
         }
 
         let bitmaps: Vec<Option<ID2D1Bitmap1>> = f.icons.iter().map(|i| self.bitmap(i.source, pixels)).collect();
+        let layouts: Vec<Option<IDWriteTextLayout>> =
+            f.labels.iter().map(|l| self.layout(&l.text, l.max_width).map(|(t, _, _)| t.clone())).collect();
 
         // Only redraw what changed: this frame's content plus whatever was drawn last frame.
         let bounds = f
@@ -293,33 +330,33 @@ impl Renderer {
             .iter()
             .map(|i| i.rect)
             .chain(f.shapes.iter().map(|s| s.rect))
-            .chain(f.label.iter().map(|l| l.rect))
-            .chain(std::iter::once(f.bar))
+            .chain(f.labels.iter().map(|l| l.rect))
+            .chain(std::iter::once(f.bar).filter(|b| b.w() > 0.0))
             .reduce(|a, b| RectF { l: a.l.min(b.l), t: a.t.min(b.t), r: a.r.max(b.r), b: a.b.max(b.b) })
             .map(|r| r.inflate(2.0));
         let to_rect = |r: RectF| RECT {
-            left: (r.l.floor() as i32).clamp(0, self.size.0 as i32),
-            top: (r.t.floor() as i32).clamp(0, self.size.1 as i32),
-            right: (r.r.ceil() as i32).clamp(0, self.size.0 as i32),
-            bottom: (r.b.ceil() as i32).clamp(0, self.size.1 as i32),
+            left: (r.l.floor() as i32).clamp(0, s.size.0 as i32),
+            top: (r.t.floor() as i32).clamp(0, s.size.1 as i32),
+            right: (r.r.ceil() as i32).clamp(0, s.size.0 as i32),
+            bottom: (r.b.ceil() as i32).clamp(0, s.size.1 as i32),
         };
         let current = bounds.map(to_rect);
-        let update = match (current, self.drawn) {
+        let update = match (current, s.drawn) {
             (Some(a), Some(b)) => RECT { left: a.left.min(b.left), top: a.top.min(b.top), right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) },
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => return Ok(()),
         };
         if update.right <= update.left || update.bottom <= update.top {
-            self.drawn = current;
+            s.drawn = current;
             return Ok(());
         }
 
         let mut offset = POINT::default();
-        let dc: ID2D1DeviceContext = unsafe { self.surface.BeginDraw(Some(&update), &mut offset)? };
-        let painted = self.paint(&dc, f, &bitmaps, offset, update);
-        unsafe { self.surface.EndDraw()? };
-        self.drawn = current;
-        painted
+        let dc: ID2D1DeviceContext = unsafe { s.surface.BeginDraw(Some(&update), &mut offset)? };
+        self.paint(&dc, f, &bitmaps, &layouts, offset, update);
+        unsafe { s.surface.EndDraw()? };
+        s.drawn = current;
+        Ok(())
     }
 
     fn fill(&self, dc: &ID2D1DeviceContext, r: RectF, radius: f32, c: Color) {
@@ -330,7 +367,15 @@ impl Renderer {
         }
     }
 
-    fn paint(&self, dc: &ID2D1DeviceContext, f: &Frame, bitmaps: &[Option<ID2D1Bitmap1>], at: POINT, update: RECT) -> Result<()> {
+    fn paint(
+        &self,
+        dc: &ID2D1DeviceContext,
+        f: &Frame,
+        bitmaps: &[Option<ID2D1Bitmap1>],
+        layouts: &[Option<IDWriteTextLayout>],
+        at: POINT,
+        update: RECT,
+    ) {
         unsafe {
             dc.SetDpi(96.0, 96.0);
             // `at` is where the update rectangle's top-left lives in the (possibly shared) surface.
@@ -363,19 +408,15 @@ impl Renderer {
                     None => self.fill(dc, icon.rect.inflate(-icon.rect.w() * 0.08), icon.rect.w() * 0.22, f.placeholder.alpha(icon.opacity * 0.7)),
                 }
             }
-            if let (Some(l), Some((text, layout, _, _))) = (&f.label, &self.label_layout)
-                && *text == l.text {
-                    self.fill(dc, l.rect, l.rect.h().min(l.rect.w()) / 2.0, l.bg);
-                    self.brush.SetColor(&color(l.fg));
-                    dc.DrawTextLayout(
-                        Vector2 { X: l.rect.l + l.pad.0, Y: l.rect.t + l.pad.1 },
-                        layout,
-                        &self.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
+            for (l, layout) in f.labels.iter().zip(layouts) {
+                let Some(layout) = layout else { continue };
+                if l.bg.a > 0.0 {
+                    self.fill(dc, l.rect, l.radius, l.bg);
                 }
+                self.brush.SetColor(&color(l.fg));
+                dc.DrawTextLayout(Vector2 { X: l.rect.l + l.pad.0, Y: l.rect.t + l.pad.1 }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
             dc.PopAxisAlignedClip();
         }
-        Ok(())
     }
 }

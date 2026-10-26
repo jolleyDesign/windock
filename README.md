@@ -3,6 +3,7 @@
 A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME's dash.
 
 - Pinned apps plus running apps, with indicators for open windows, the focused app and apps asking for attention
+- Live window previews on hover, like the Windows taskbar
 - macOS-style magnification (optional), frosted-glass background, light/dark theme that follows Windows
 - Bottom, top, left or right edge, any monitor, optional auto-hide
 - Drag icons to reorder, drop files onto the dock to pin them, drag an icon off to remove it
@@ -17,7 +18,8 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Click a running app | Bring its most recent window forward |
 | Click the focused app | Minimize it (or cycle through its windows, if it has several) |
 | Middle-click | Open a new window / instance |
-| Right-click | Open, New window, Keep in dock / Remove from dock, Close windows, Dock settings…, Quit |
+| Hover a running app | Live previews of its windows: click one to switch to it, **✕** or middle-click to close it |
+| Right-click | Pick a window (when there are several), Open, New window, Keep in dock / Remove from dock, Close windows, Import taskbar pins, Dock settings…, Quit |
 | Drag an icon along the dock | Reorder pinned apps |
 | Drag an icon off the dock and release | Unpin it |
 | Drop files, shortcuts or folders onto the dock | Pin them at that position |
@@ -37,6 +39,7 @@ reserve_space = false    # keep maximized windows from covering the dock
 show_running = true
 show_all_desktops = false
 show_labels = true
+previews = true          # live window previews on hover
 hide_on_fullscreen = true
 click_minimizes = true
 autostart = false        # start at sign-in
@@ -93,8 +96,12 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | File | Role |
 | --- | --- |
 | `src/app.rs` | The dock window: layout, magnification, input, drag & drop, auto-hide, animation loop |
+| `src/app/preview.rs` | The hover popup with live DWM window thumbnails |
+| `src/settings.rs` | The settings window (`windock.exe --settings`, egui) |
+| `src/taskbar.rs` | Reads the taskbar's pinned apps for importing |
+| `src/logo.rs`, `build.rs` | The app icon, drawn in code and embedded at build time |
 | `src/apps.rs` | Finds taskbar-worthy windows and groups them by AppUserModelID / executable |
-| `src/render.rs` | Windows.UI.Composition visuals: a host-backdrop (blur) visual and a Direct2D surface |
+| `src/render.rs` | A shared Direct2D device plus a composition surface per window, each with a host-backdrop (blur) visual |
 | `src/icons.rs` | Loads high-resolution shell icons on a background thread |
 | `src/config.rs` | TOML schema, theme palettes, comment-preserving saves of `[[pinned]]` |
 | `src/shell.rs` | Launching, shortcuts, version info, registry, theme detection |

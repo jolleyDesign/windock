@@ -6,6 +6,8 @@ use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
+use std::collections::HashMap;
+use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
@@ -22,6 +24,9 @@ pub struct AppKey {
     pub exe: Option<String>,
     /// The process is a packaged (Store/MSIX) app, so it should be launched via its AUMID.
     pub packaged: bool,
+    /// Executables of the processes that launched this one (parent first), stopping at
+    /// anything that's part of Windows itself.
+    pub ancestors: Vec<String>,
 }
 
 impl AppKey {
@@ -35,6 +40,19 @@ impl AppKey {
             return a.eq_ignore_ascii_case(b) && (self.aumid.is_none() || other.aumid.is_none());
         }
         false
+    }
+
+    /// Whether a pinned app should claim a window that belongs to one of its helper
+    /// processes, e.g. Steam's UI runs in steamwebhelper.exe, launched by steam.exe.
+    /// The window must carry its own app ID and live inside the app's install folder, so
+    /// that games launched by Steam (or apps launched from an editor) aren't claimed.
+    pub fn adopts(&self, window: &AppKey) -> bool {
+        let (Some(exe), Some(window_exe)) = (&self.exe, &window.exe) else { return false };
+        let Some(dir) = std::path::Path::new(exe).parent() else { return false };
+        let dir = format!("{}\\", dir.to_string_lossy().to_lowercase());
+        window.aumid.is_some()
+            && window.ancestors.iter().any(|a| a.eq_ignore_ascii_case(exe))
+            && window_exe.to_lowercase().starts_with(&dir)
     }
 
     pub fn group_id(&self) -> String {
@@ -185,7 +203,40 @@ pub fn window_key(hwnd: HWND) -> AppKey {
         packaged: pkg.is_some(),
         aumid: explicit.or(pkg),
         exe: process_path(pid),
+        ancestors: ancestor_exes(pid),
     }
+}
+
+/// Up to three generations of parent processes, stopping at Windows' own processes
+/// (Explorer, services, shells), which launch everything and so say nothing about it.
+fn ancestor_exes(pid: u32) -> Vec<String> {
+    let mut parents = HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut entry).is_ok();
+        while ok {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            ok = Process32NextW(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    let windows_dir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()).to_lowercase() + "\\";
+    let mut out = Vec::new();
+    let mut current = pid;
+    for _ in 0..3 {
+        let Some(&parent) = parents.get(&current) else { break };
+        if parent == 0 || parent == current {
+            break;
+        }
+        let Some(exe) = process_path(parent) else { break };
+        if exe.to_lowercase().starts_with(&windows_dir) {
+            break;
+        }
+        out.push(exe);
+        current = parent;
+    }
+    out
 }
 
 /// Brings a window forward. For a window on another virtual desktop, Windows switches to that desktop.
@@ -237,5 +288,39 @@ pub fn fullscreen_app_on(monitor: HMONITOR) -> bool {
         }
         let fg = GetForegroundWindow();
         !fg.is_invalid() && MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) == monitor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(aumid: Option<&str>, exe: &str, ancestors: &[&str]) -> AppKey {
+        AppKey {
+            aumid: aumid.map(str::to_string),
+            exe: Some(exe.to_string()),
+            packaged: false,
+            ancestors: ancestors.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const STEAM: &str = r"C:\Program Files (x86)\Steam\steam.exe";
+
+    #[test]
+    fn pinned_app_adopts_its_helper_processes_windows() {
+        let pin = key(None, STEAM, &[]);
+        let ui = key(Some("Valve.Steam.Client"), r"C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe", &[STEAM]);
+        assert!(!pin.matches(&ui));
+        assert!(pin.adopts(&ui));
+    }
+
+    #[test]
+    fn launched_games_and_unrelated_apps_are_not_adopted() {
+        let pin = key(None, STEAM, &[]);
+        let game = key(None, r"C:\Program Files (x86)\Steam\steamapps\common\Game\game.exe", &[STEAM]);
+        assert!(!pin.adopts(&game), "no app ID of its own");
+        let editor = key(None, r"C:\Code\Code.exe", &[]);
+        let browser = key(Some("Chrome"), r"C:\Chrome\chrome.exe", &[r"C:\Code\Code.exe"]);
+        assert!(!editor.adopts(&browser), "outside the editor's folder");
     }
 }

@@ -1,9 +1,11 @@
 //! The dock window: layout, magnification, input, window tracking and animation.
 
+mod preview;
+
 use crate::apps::{self, AppKey};
-use crate::config::{self, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
+use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
 use crate::icons::{IconLoader, IconPixels};
-use crate::render::{Frame, IconDraw, LabelDraw, RectF, Renderer, Shape};
+use crate::render::{Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface};
 use crate::shell;
 use crate::taskbar;
 use crate::util::{from_wide, wide};
@@ -306,7 +308,13 @@ pub struct App {
     cfg_text: String,
     palette: Palette,
     blur: bool,
-    renderer: Option<Renderer>,
+    gpu: Option<Gpu>,
+    /// The dock's drawing surface (the preview popup has its own).
+    surface: Option<Surface>,
+    preview: preview::Preview,
+    /// Screen position of the dock window, and the work area of its monitor.
+    origin: (i32, i32),
+    work: RECT,
     render_failures: u32,
     monitor: HMONITOR,
     axis: Axis,
@@ -363,9 +371,10 @@ impl App {
             let on = BOOL(1);
             let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(17), &on as *const _ as _, 4);
         }
-        let renderer = Renderer::new(hwnd, 1, 1, cfg.dock.gpu)
-            .inspect_err(|e| crate::log!("renderer init failed: {e}"))
-            .ok();
+        let gpu = Gpu::new(cfg.dock.gpu).inspect_err(|e| crate::log!("renderer init failed: {e}")).ok();
+        let surface = gpu.as_ref().and_then(|g| g.create_surface(hwnd, 1, 1).inspect_err(|e| crate::log!("surface init failed: {e}")).ok());
+        let instance = unsafe { GetModuleHandleW(None) }.map(HINSTANCE::from).unwrap_or_default();
+        let preview_hwnd = preview::create_window(instance).inspect_err(|e| crate::log!("preview window failed: {e}")).unwrap_or_default();
         Self {
             hwnd,
             own_pid: unsafe { GetCurrentProcessId() },
@@ -374,7 +383,11 @@ impl App {
             cfg_path,
             cfg_text,
             blur: true,
-            renderer,
+            gpu,
+            surface,
+            preview: preview::Preview::new(preview_hwnd),
+            origin: (0, 0),
+            work: RECT::default(),
             render_failures: 0,
             monitor: HMONITOR::default(),
             axis: Axis::default(),
@@ -455,6 +468,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        self.close_preview();
         unsafe {
             for h in self.hooks.drain(..) {
                 let _ = UnhookWinEvent(h);
@@ -498,7 +512,8 @@ impl App {
                     self.refresh_windows();
                 }
                 if old.dock.gpu != self.cfg.dock.gpu {
-                    self.renderer = None;
+                    self.gpu = None;
+                    self.surface = None;
                     self.recreate_renderer();
                 }
                 if !self.cfg.dock.autohide {
@@ -643,9 +658,14 @@ impl App {
             let _ = SetWindowPos(self.hwnd, Some(z), x, y, w, h, SWP_NOACTIVATE);
         }
         self.axis = Axis { pos, w: w as f32, h: h as f32 };
-        if let Some(r) = &mut self.renderer {
-            let _ = r.resize(w as u32, h as u32);
-            r.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * s);
+        self.origin = (x, y);
+        self.work = mi.rcWork;
+        self.close_preview();
+        if let Some(sf) = &mut self.surface {
+            let _ = sf.resize(w as u32, h as u32);
+        }
+        if let Some(g) = &mut self.gpu {
+            g.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * s);
         }
 
         // Load icons at the largest size they'll be drawn.
@@ -654,8 +674,8 @@ impl App {
             self.icon_px = px;
             self.icons.clear();
             self.loader.reset();
-            if let Some(r) = &mut self.renderer {
-                r.clear_bitmaps();
+            if let Some(g) = &mut self.gpu {
+                g.clear_bitmaps();
             }
             self.request_icons();
         }
@@ -757,6 +777,7 @@ impl App {
         self.windows = list;
         self.fg = apps::foreground().0 as isize;
         self.rebuild_items();
+        self.refresh_preview();
     }
 
     fn pin_info(&mut self, path: &str) -> (AppKey, String) {
@@ -764,14 +785,14 @@ impl App {
             return info.clone();
         }
         let info = if let Some(aumid) = shell::apps_folder_aumid(path) {
-            let key = AppKey { aumid: Some(aumid.to_string()), exe: None, packaged: true };
+            let key = AppKey { aumid: Some(aumid.to_string()), exe: None, packaged: true, ..Default::default() };
             (key, shell::display_name(path).unwrap_or_else(|| aumid.to_string()))
         } else if path.to_lowercase().ends_with(".lnk") {
             let (target, aumid) = shell::resolve_lnk(path);
             let name = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            (AppKey { aumid, exe: target, packaged: false }, name)
+            (AppKey { aumid, exe: target, packaged: false, ..Default::default() }, name)
         } else {
-            (AppKey { aumid: None, exe: Some(path.to_string()), packaged: false }, shell::friendly_name(path))
+            (AppKey { aumid: None, exe: Some(path.to_string()), packaged: false, ..Default::default() }, shell::friendly_name(path))
         };
         self.pins.insert(path.to_string(), info.clone());
         info
@@ -817,8 +838,13 @@ impl App {
         wins.sort_by_key(|w| w.2);
         let mut running: Vec<Item> = Vec::new();
         for (h, key, _) in wins {
-            if let Some(it) = items[..pinned].iter_mut().find(|it| it.key.matches(&key)) {
-                it.windows.push(h);
+            // Exact matches first; then pinned apps claiming their helper processes' windows.
+            let owner = items[..pinned]
+                .iter()
+                .position(|it| it.key.matches(&key))
+                .or_else(|| items[..pinned].iter().position(|it| it.key.adopts(&key)));
+            if let Some(i) = owner {
+                items[i].windows.push(h);
                 continue;
             }
             if !self.cfg.dock.show_running {
@@ -1036,6 +1062,7 @@ impl App {
 
         self.layout = self.compute_layout();
         self.render();
+        self.follow_hover_for_preview();
         self.animating = moving;
     }
 
@@ -1074,14 +1101,16 @@ impl App {
         let mut region = vec![ax.rect(b0, b1, 0.0, m.margin + m.thick)];
 
         // Label: the hovered app's name, or a notice (e.g. a config error).
-        let hovered = self.hovered_index().filter(|_| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open);
+        let hovered = self
+            .hovered_index()
+            .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id));
         let label_req = match (&self.notice, hovered) {
             (Some((text, _)), _) => Some((text.clone(), (b0 + b1) / 2.0, m.margin + m.thick)),
             (None, Some(i)) => self.icon_uv(i).map(|(u0, u1, _, v1)| (self.items[i].name.clone(), (u0 + u1) / 2.0, v1)),
             _ => None,
         };
         let label = label_req.and_then(|(text, cu, top)| {
-            let (tw, th) = self.renderer.as_mut()?.measure_label(&text)?;
+            let (tw, th) = self.gpu.as_mut()?.measure(&text, 4000.0)?;
             let pad = (10.0 * m.s, 4.0 * m.s);
             let (pw, ph) = (tw + 2.0 * pad.0, th + 2.0 * pad.1);
             let v0 = top + 8.0 * m.s;
@@ -1092,7 +1121,8 @@ impl App {
                 ax.rect(cu - ph / 2.0, cu + ph / 2.0, v0, v0 + pw)
             };
             region.push(rect);
-            Some(LabelDraw { rect, text, bg: pal.label_bg, fg: pal.label_text, pad })
+            let radius = rect.h().min(rect.w()) / 2.0;
+            Some(LabelDraw { rect, radius, text, max_width: 4000.0, bg: pal.label_bg, fg: pal.label_text, pad })
         });
 
         let mut shapes = Vec::new();
@@ -1162,31 +1192,39 @@ impl App {
             placeholder: pal.placeholder,
             shapes,
             icons,
-            label,
+            labels: label.into_iter().collect(),
         };
-        if let Some(r) = &mut self.renderer {
-            match r.draw(&frame, &self.icons) {
+        if let (Some(g), Some(sf)) = (&mut self.gpu, &mut self.surface) {
+            match g.draw(sf, &frame, &self.icons) {
                 Ok(()) => self.render_failures = 0,
                 Err(e) => {
                     crate::log!("draw failed: {e}; recreating renderer");
-                    self.renderer = None;
+                    self.gpu = None;
+                    self.surface = None;
                     self.render_failures += 1;
                 }
             }
         }
         drop(frame);
         // e.g. the GPU was reset; retry a few times rather than spinning forever.
-        if self.renderer.is_none() && self.render_failures < 5 {
+        if (self.gpu.is_none() || self.surface.is_none()) && self.render_failures < 5 {
             self.recreate_renderer();
         }
         self.update_region(region, offset);
     }
 
     fn recreate_renderer(&mut self) {
-        match Renderer::new(self.hwnd, self.axis.w as u32, self.axis.h as u32, self.cfg.dock.gpu) {
-            Ok(mut r) => {
-                r.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * self.m.s);
-                self.renderer = Some(r);
+        let made = Gpu::new(self.cfg.dock.gpu).and_then(|g| {
+            let sf = g.create_surface(self.hwnd, self.axis.w as u32, self.axis.h as u32)?;
+            Ok((g, sf))
+        });
+        match made {
+            Ok((mut g, sf)) => {
+                g.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * self.m.s);
+                self.gpu = Some(g);
+                self.surface = Some(sf);
+                self.preview.reset_surface();
+                self.close_preview();
                 self.dirty = true;
             }
             Err(e) => crate::log!("renderer init failed: {e}"),
@@ -1270,6 +1308,7 @@ impl App {
             return;
         }
         self.cursor = None;
+        self.preview_dock_left();
         self.schedule_hide(self.cfg.dock.autohide_delay_ms);
         self.dirty = true;
     }
@@ -1277,6 +1316,7 @@ impl App {
     fn on_down(&mut self, x: f32, y: f32) {
         self.cursor = Some((x, y));
         let id = self.hovered_index().map(|i| self.items[i].id.clone());
+        self.close_preview();
         self.press = Some(Press { id, x, y });
         unsafe {
             SetCapture(self.hwnd);
@@ -1450,6 +1490,7 @@ impl App {
 
     fn menu_spec(&mut self, x: f32, y: f32) -> MenuSpec {
         self.cursor = Some((x, y));
+        self.close_preview();
         let idx = self.hovered_index();
         let mut entries = Vec::new();
         let mut windows = Vec::new();
@@ -1571,8 +1612,10 @@ impl App {
                 match wp.0 {
                     TIMER_REFRESH => self.refresh_windows(),
                     TIMER_CONFIG => self.reload_config(),
+                    preview::TIMER_PREVIEW => self.preview_timer(),
+                    preview::TIMER_PREVIEW_CLOSE => self.close_preview(),
                     TIMER_HIDE => {
-                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() {
+                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() && !self.preview.is_open() {
                             self.hide_target = 1.0;
                             self.dirty = true;
                         }
