@@ -11,7 +11,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, PWSTR};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
+use windows::core::{BOOL, GUID, PWSTR};
 
 /// Identifies an app. Windows match pinned items by AppUserModelID first, then by executable.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -66,8 +68,18 @@ fn is_cloaked(hwnd: HWND) -> bool {
     }
 }
 
-/// Roughly the same rules the taskbar and Alt+Tab use.
-pub fn is_app_window(hwnd: HWND, own_pid: u32) -> bool {
+/// Windows on other virtual desktops are cloaked by the shell; tell those apart from
+/// windows that are cloaked for other reasons (e.g. suspended Store apps).
+fn on_other_desktop(desktops: &IVirtualDesktopManager, hwnd: HWND) -> bool {
+    unsafe {
+        desktops.IsWindowOnCurrentVirtualDesktop(hwnd).is_ok_and(|here| !here.as_bool())
+            && desktops.GetWindowDesktopId(hwnd).is_ok_and(|id| id != GUID::zeroed())
+    }
+}
+
+/// Roughly the same rules the taskbar and Alt+Tab use. With `desktops`, windows on other
+/// virtual desktops count too.
+pub fn is_app_window(hwnd: HWND, own_pid: u32, desktops: Option<&IVirtualDesktopManager>) -> bool {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
             return false;
@@ -82,7 +94,10 @@ pub fn is_app_window(hwnd: HWND, own_pid: u32) -> bool {
                 return false;
             }
         }
-        if GetWindowTextLengthW(hwnd) == 0 || is_cloaked(hwnd) || pid_of(hwnd) == own_pid {
+        if GetWindowTextLengthW(hwnd) == 0 || pid_of(hwnd) == own_pid {
+            return false;
+        }
+        if is_cloaked(hwnd) && !desktops.is_some_and(|d| on_other_desktop(d, hwnd)) {
             return false;
         }
         !matches!(
@@ -93,7 +108,7 @@ pub fn is_app_window(hwnd: HWND, own_pid: u32) -> bool {
 }
 
 /// Top-level app windows in z-order (topmost first).
-pub fn app_windows(own_pid: u32) -> Vec<HWND> {
+pub fn app_windows(own_pid: u32, all_desktops: bool) -> Vec<HWND> {
     unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         let out = unsafe { &mut *(lp.0 as *mut Vec<HWND>) };
         out.push(hwnd);
@@ -103,7 +118,10 @@ pub fn app_windows(own_pid: u32) -> Vec<HWND> {
     unsafe {
         let _ = EnumWindows(Some(cb), LPARAM(&mut all as *mut _ as isize));
     }
-    all.retain(|&h| is_app_window(h, own_pid));
+    let desktops: Option<IVirtualDesktopManager> = all_desktops
+        .then(|| unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_INPROC_SERVER) }.ok())
+        .flatten();
+    all.retain(|&h| is_app_window(h, own_pid, desktops.as_ref()));
     all
 }
 
@@ -170,6 +188,7 @@ pub fn window_key(hwnd: HWND) -> AppKey {
     }
 }
 
+/// Brings a window forward. For a window on another virtual desktop, Windows switches to that desktop.
 pub fn activate(hwnd: HWND) {
     unsafe {
         if IsIconic(hwnd).as_bool() {

@@ -34,6 +34,7 @@ pub fn run() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
+            .with_icon(egui::IconData { rgba: crate::logo::rgba(64), width: 64, height: 64 })
             .with_inner_size([580.0, 680.0])
             .with_min_inner_size([480.0, 420.0]),
         ..Default::default()
@@ -221,6 +222,7 @@ impl Settings {
         c |= toggle(ui, &mut d.always_on_top, "Always on top", "");
         c |= toggle(ui, &mut d.hide_on_fullscreen, "Hide for full screen", "Games and videos");
         c |= toggle(ui, &mut d.show_running, "Show running apps", "Includes apps that aren't pinned");
+        c |= toggle(ui, &mut d.show_all_desktops, "All virtual desktops", "Clicking an app switches to its desktop");
         c |= toggle(ui, &mut d.show_labels, "Show app names", "On hover");
         c |= toggle(ui, &mut d.click_minimizes, "Click to minimize", "Clicking the focused app minimizes it");
 

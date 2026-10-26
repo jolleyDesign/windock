@@ -47,6 +47,8 @@ const CMD_CLOSE: u32 = 4;
 const CMD_SETTINGS: u32 = 5;
 const CMD_QUIT: u32 = 6;
 const CMD_IMPORT: u32 = 7;
+/// Menu ids from here up pick a window: CMD_WINDOW + index into `MenuSpec::windows`.
+const CMD_WINDOW: u32 = 100;
 
 /// One hop of the launch bounce, in seconds.
 const BOUNCE_PERIOD: f32 = 0.55;
@@ -262,9 +264,26 @@ struct Drag {
     removing: bool,
 }
 
+struct MenuEntry {
+    /// 0 for a separator.
+    id: u32,
+    label: String,
+    checked: bool,
+}
+
+impl MenuEntry {
+    fn new(id: u32, label: impl Into<String>) -> Self {
+        Self { id, label: label.into(), checked: false }
+    }
+    fn separator() -> Self {
+        Self::new(0, "")
+    }
+}
+
 pub struct MenuSpec {
     item: Option<String>,
-    entries: Vec<(u32, String)>,
+    entries: Vec<MenuEntry>,
+    windows: Vec<isize>,
     align: TRACK_POPUP_MENU_FLAGS,
 }
 
@@ -474,6 +493,9 @@ impl App {
                 let old = std::mem::replace(&mut self.cfg, cfg);
                 if old.dock.autostart != self.cfg.dock.autostart {
                     shell::set_autostart(self.cfg.dock.autostart);
+                }
+                if old.dock.show_all_desktops != self.cfg.dock.show_all_desktops {
+                    self.refresh_windows();
                 }
                 if old.dock.gpu != self.cfg.dock.gpu {
                     self.renderer = None;
@@ -707,7 +729,7 @@ impl App {
     // ---------------------------------------------------------------- model
 
     fn refresh_windows(&mut self) {
-        let hwnds = apps::app_windows(self.own_pid);
+        let hwnds = apps::app_windows(self.own_pid, self.cfg.dock.show_all_desktops);
         let mut list = Vec::with_capacity(hwnds.len());
         for h in hwnds {
             let id = h.0 as isize;
@@ -1429,26 +1451,42 @@ impl App {
     fn menu_spec(&mut self, x: f32, y: f32) -> MenuSpec {
         self.cursor = Some((x, y));
         let idx = self.hovered_index();
-        let mut entries: Vec<(u32, String)> = Vec::new();
+        let mut entries = Vec::new();
+        let mut windows = Vec::new();
         if let Some(it) = idx.map(|i| &self.items[i]) {
+            // With several windows open, list them so any one is a click away.
+            if it.windows.len() > 1 {
+                let fg = apps::foreground().0 as isize;
+                for (n, &w) in it.windows.iter().enumerate() {
+                    let mut title = apps::title(HWND(w as _));
+                    if title.chars().count() > 60 {
+                        title = title.chars().take(59).collect::<String>() + "…";
+                    }
+                    // `&` marks a keyboard shortcut in menus; `&&` is a literal ampersand.
+                    let label = title.replace('&', "&&");
+                    entries.push(MenuEntry { id: CMD_WINDOW + n as u32, label, checked: w == fg });
+                    windows.push(w);
+                }
+                entries.push(MenuEntry::separator());
+            }
             if it.launch.is_some() {
-                entries.push((CMD_OPEN, if it.windows.is_empty() { "Open" } else { "New window" }.into()));
+                entries.push(MenuEntry::new(CMD_OPEN, if it.windows.is_empty() { "Open" } else { "New window" }));
             }
             match it.kind {
-                Kind::Pinned(_) => entries.push((CMD_UNPIN, "Remove from dock".into())),
-                Kind::Running if it.launch.is_some() => entries.push((CMD_PIN, "Keep in dock".into())),
+                Kind::Pinned(_) => entries.push(MenuEntry::new(CMD_UNPIN, "Remove from dock")),
+                Kind::Running if it.launch.is_some() => entries.push(MenuEntry::new(CMD_PIN, "Keep in dock")),
                 _ => {}
             }
             match it.windows.len() {
                 0 => {}
-                1 => entries.push((CMD_CLOSE, "Close window".into())),
-                n => entries.push((CMD_CLOSE, format!("Close all {n} windows"))),
+                1 => entries.push(MenuEntry::new(CMD_CLOSE, "Close window")),
+                n => entries.push(MenuEntry::new(CMD_CLOSE, format!("Close all {n} windows"))),
             }
-            entries.push((0, String::new()));
+            entries.push(MenuEntry::separator());
         }
-        entries.push((CMD_IMPORT, "Import taskbar pins".into()));
-        entries.push((CMD_SETTINGS, "Dock settings…".into()));
-        entries.push((CMD_QUIT, "Quit Windock".into()));
+        entries.push(MenuEntry::new(CMD_IMPORT, "Import taskbar pins"));
+        entries.push(MenuEntry::new(CMD_SETTINGS, "Dock settings…"));
+        entries.push(MenuEntry::new(CMD_QUIT, "Quit Windock"));
         self.menu_open = true;
         self.dirty = true;
         let align = match self.cfg.dock.position {
@@ -1457,7 +1495,7 @@ impl App {
             Position::Left => TPM_LEFTALIGN | TPM_VCENTERALIGN,
             Position::Right => TPM_RIGHTALIGN | TPM_VCENTERALIGN,
         };
-        MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, align }
+        MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, windows, align }
     }
 
     fn menu_command(&mut self, spec: &MenuSpec, cmd: u32) {
@@ -1492,6 +1530,11 @@ impl App {
                 self.show_notice(text, INFO_TIME);
             }
             (CMD_SETTINGS, _) => open_settings(),
+            (c, _) if c >= CMD_WINDOW => {
+                if let Some(&w) = spec.windows.get((c - CMD_WINDOW) as usize) {
+                    apps::activate(HWND(w as _));
+                }
+            }
             (CMD_QUIT, _) => unsafe {
                 let _ = DestroyWindow(self.hwnd);
             },
@@ -1693,12 +1736,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 unsafe fn show_menu(hwnd: HWND, spec: &MenuSpec) -> u32 {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return 0 };
-        for (id, label) in &spec.entries {
-            if *id == 0 {
+        for e in &spec.entries {
+            if e.id == 0 {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             } else {
-                let text = wide(label);
-                let _ = AppendMenuW(menu, MF_STRING, *id as usize, PCWSTR(text.as_ptr()));
+                let text = wide(&e.label);
+                let flags = if e.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+                let _ = AppendMenuW(menu, flags, e.id as usize, PCWSTR(text.as_ptr()));
             }
         }
         let mut pt = POINT::default();
@@ -1720,6 +1764,8 @@ pub fn run() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // Resource 1 is the icon build.rs embeds.
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as _)).unwrap_or_default(),
             lpszClassName: class,
             ..Default::default()
         };

@@ -35,6 +35,7 @@ monitor = "primary"      # or 0, 1, ...
 autohide = false
 reserve_space = false    # keep maximized windows from covering the dock
 show_running = true
+show_all_desktops = false
 show_labels = true
 hide_on_fullscreen = true
 click_minimizes = true

@@ -4,6 +4,7 @@ mod app;
 mod apps;
 mod config;
 mod icons;
+mod logo;
 mod render;
 mod settings;
 mod shell;

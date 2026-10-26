@@ -110,6 +110,7 @@ pub struct Dock {
     pub reserve_space: bool,
     pub always_on_top: bool,
     pub show_running: bool,
+    pub show_all_desktops: bool,
     pub show_labels: bool,
     pub hide_on_fullscreen: bool,
     pub click_minimizes: bool,
@@ -127,6 +128,7 @@ impl Default for Dock {
             reserve_space: false,
             always_on_top: true,
             show_running: true,
+            show_all_desktops: false,
             show_labels: true,
             hide_on_fullscreen: true,
             click_minimizes: true,
@@ -512,6 +514,7 @@ autohide_delay_ms = 400
 reserve_space = false        # stop maximized windows from covering the dock
 always_on_top = true
 show_running = true          # also show running apps that aren't pinned
+show_all_desktops = false    # include apps on other virtual desktops
 show_labels = true           # show the app name while hovering
 hide_on_fullscreen = true    # get out of the way of games and videos
 click_minimizes = true       # clicking the focused app minimizes it
