@@ -23,6 +23,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmFlush, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::{FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindFirstChangeNotificationW, FindNextChangeNotification};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, INFINITE, WaitForSingleObject};
 use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions};
@@ -44,6 +45,8 @@ const WM_APP_DROP: u32 = WM_APP + 6;
 const WM_APP_TASKBAR_SHOWN: u32 = WM_APP + 7;
 /// Volume, network or battery changed (posted from system threads).
 const WM_APP_STATUS: u32 = WM_APP + 8;
+/// An app failed to start; wparam is a `Box<String>` holding the item's id.
+const WM_APP_LAUNCH_FAILED: u32 = WM_APP + 9;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
@@ -1698,11 +1701,36 @@ impl App {
 
     fn launch(&mut self, i: usize) {
         let Some(l) = self.items[i].launch.clone() else { return };
-        if shell::launch(&l.path, l.args.as_deref(), l.cwd.as_deref()) && self.cfg.animation.bounce_on_launch {
+        self.start_app(i, 3.0, move || shell::launch(&l.path, l.args.as_deref(), l.cwd.as_deref()));
+    }
+
+    /// Bounces item `i` while `start` runs on its own thread. ShellExecuteEx returns only once
+    /// the app has started, which can take half a second, so the dock mustn't wait for it.
+    fn start_app(&mut self, i: usize, hops: f32, start: impl FnOnce() -> bool + Send + 'static) {
+        if self.cfg.animation.bounce_on_launch {
             let it = &mut self.items[i];
             it.bounce = Some(0.0);
-            it.bounce_end = BOUNCE_PERIOD * 3.0;
+            it.bounce_end = BOUNCE_PERIOD * hops;
             self.dirty = true;
+        }
+        let id = self.items[i].id.clone();
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            if !start() {
+                post(WM_APP_LAUNCH_FAILED, Box::into_raw(Box::new(id)) as usize);
+            }
+            unsafe { CoUninitialize() };
+        });
+    }
+
+    /// Lets the bounce of an app that failed to start finish its current hop, then stop.
+    fn launch_failed(&mut self, id: &str) {
+        if let Some(it) = self.items.iter_mut().find(|it| it.id == id)
+            && let Some(t) = it.bounce
+        {
+            it.bounce_end = ((t / BOUNCE_PERIOD).ceil() * BOUNCE_PERIOD).max(BOUNCE_PERIOD);
         }
     }
 
@@ -2001,6 +2029,10 @@ impl App {
             WM_TIMECHANGE => self.update_clock(),
             // Changes arrive in bursts (e.g. a volume slider dragging); read once they settle.
             WM_APP_STATUS => self.set_timer(TIMER_STATUS, 100),
+            WM_APP_LAUNCH_FAILED => {
+                let id = unsafe { Box::from_raw(wp.0 as *mut String) };
+                self.launch_failed(&id);
+            }
             WM_POWERBROADCAST => {
                 if wp.0 as u32 == PBT_APMPOWERSTATUSCHANGE {
                     self.set_timer(TIMER_STATUS, 100);

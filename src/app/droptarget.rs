@@ -198,11 +198,8 @@ impl App {
 
     fn open_files_with(&mut self, i: usize, files: &[String]) {
         let Some(l) = self.items[i].launch.clone() else { return };
-        if shell::open_with(&l.path, l.args.as_deref(), l.cwd.as_deref(), files) && self.cfg.animation.bounce_on_launch {
-            let it = &mut self.items[i];
-            it.bounce = Some(0.0);
-            it.bounce_end = BOUNCE_PERIOD;
-        }
+        let files = files.to_vec();
+        self.start_app(i, 1.0, move || shell::open_with(&l.path, l.args.as_deref(), l.cwd.as_deref(), &files));
         self.dirty = true;
     }
 
