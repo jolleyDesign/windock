@@ -7,13 +7,12 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN, VK_N, VK_X};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_SHOWNORMAL};
-use windows::core::{HSTRING, PCSTR, PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 pub const APPS_FOLDER: &str = r"shell:AppsFolder\";
 
@@ -258,26 +257,6 @@ pub fn set_autostart(enabled: bool) {
             );
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, run, w!("Windock"));
-        }
-    }
-}
-
-/// Makes Win32 popup menus follow the dark/light theme.
-/// Uses uxtheme's unnamed exports (SetPreferredAppMode=135, FlushMenuThemes=136), as Explorer does.
-pub fn set_menu_theme(mode: crate::config::Theme) {
-    unsafe {
-        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
-        let set_mode = GetProcAddress(ux, PCSTR(135 as *const u8));
-        let flush = GetProcAddress(ux, PCSTR(136 as *const u8));
-        if let (Some(set_mode), Some(flush)) = (set_mode, flush) {
-            let set_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
-            let flush: extern "system" fn() = std::mem::transmute(flush);
-            set_mode(match mode {
-                crate::config::Theme::Auto => 1,
-                crate::config::Theme::Dark => 2,
-                crate::config::Theme::Light => 3,
-            });
-            flush();
         }
     }
 }

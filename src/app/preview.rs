@@ -119,7 +119,7 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 impl App {
     /// Called every frame: opens, switches or closes the preview to follow the hovered app.
     pub(super) fn follow_hover_for_preview(&mut self) {
-        let enabled = self.cfg.dock.previews && self.drag.is_none() && self.dragging.is_none() && self.press.is_none() && !self.menu_open;
+        let enabled = self.cfg.dock.previews && self.drag.is_none() && self.dragging.is_none() && self.press.is_none() && !self.menu.is_open();
         let hovered = self.hovered_index().filter(|_| enabled);
         let target = hovered.filter(|&i| !self.items[i].windows.is_empty()).map(|i| self.items[i].id.clone());
         match (self.preview.item.clone(), target) {

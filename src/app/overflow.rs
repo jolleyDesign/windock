@@ -162,20 +162,7 @@ impl App {
         let g = self.flyout.grid;
         let anchor = self.items.iter().position(|it| it.kind == Kind::TrayOverflow);
         let Some((u0, u1, _, v1)) = anchor.and_then(|i| self.icon_uv(i)) else { return };
-        let (dx, dy) = self.axis.toward_edge(self.slide_distance());
-        let (ax, ay) = self.axis.xy((u0 + u1) / 2.0, v1 + 8.0 * self.m.s);
-        let (ax, ay) = (self.origin.0 as f32 + ax + dx, self.origin.1 as f32 + ay + dy);
-        // Where the grid's top-left corner goes on screen.
-        let (gx, gy) = match self.axis.pos {
-            Position::Bottom => (ax - g.w() / 2.0, ay - g.h()),
-            Position::Top => (ax - g.w() / 2.0, ay),
-            Position::Left => (ax, ay - g.h() / 2.0),
-            Position::Right => (ax - g.w(), ay - g.h() / 2.0),
-        };
-        let margin = 8.0 * self.m.s;
-        let wk = self.work;
-        let gx = gx.clamp(wk.left as f32 + margin, (wk.right as f32 - g.w() - margin).max(wk.left as f32 + margin));
-        let gy = gy.clamp(wk.top as f32 + margin, (wk.bottom as f32 - g.h() - margin).max(wk.top as f32 + margin));
+        let (gx, gy) = self.place_beside((u0 + u1) / 2.0, v1 + 8.0 * self.m.s, g.w(), g.h());
         let (x, y) = ((gx - g.l).round() as i32, (gy - g.t).round() as i32);
         let (wi, hi) = (w.ceil() as i32, h.ceil() as i32);
         self.flyout.region.clear();

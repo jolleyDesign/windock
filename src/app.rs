@@ -1,6 +1,7 @@
 //! The dock window: layout, magnification, input, window tracking and animation.
 
 mod droptarget;
+mod menu;
 mod overflow;
 mod preview;
 
@@ -14,7 +15,8 @@ use crate::shell;
 use crate::status;
 use crate::taskbar;
 use crate::tray;
-use crate::util::{from_wide, wide};
+use crate::util::from_wide;
+use menu::{MenuEntry, MenuSpec};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
@@ -336,29 +338,6 @@ struct Drag {
     removing: bool,
 }
 
-struct MenuEntry {
-    /// 0 for a separator.
-    id: u32,
-    label: String,
-    checked: bool,
-}
-
-impl MenuEntry {
-    fn new(id: u32, label: impl Into<String>) -> Self {
-        Self { id, label: label.into(), checked: false }
-    }
-    fn separator() -> Self {
-        Self::new(0, "")
-    }
-}
-
-pub struct MenuSpec {
-    item: Option<String>,
-    entries: Vec<MenuEntry>,
-    windows: Vec<isize>,
-    align: TRACK_POPUP_MENU_FLAGS,
-}
-
 fn approach(x: &mut f32, target: f32, k: f32, eps: f32) -> bool {
     if (target - *x).abs() <= eps {
         let moved = *x != target;
@@ -383,6 +362,7 @@ pub struct App {
     surface: Option<Surface>,
     preview: preview::Preview,
     flyout: overflow::Flyout,
+    menu: menu::Menu,
     /// Screen position of the dock window, and the work area of its monitor.
     origin: (i32, i32),
     work: RECT,
@@ -432,7 +412,6 @@ pub struct App {
     dragging: Option<droptarget::Dragging>,
     /// A drop waiting to be carried out (see `drag_drop`).
     dropped: Option<(droptarget::DropAction, Vec<String>)>,
-    menu_open: bool,
     hotkeys: Vec<i32>,
     /// Hidden with the show/hide shortcut.
     user_hidden: bool,
@@ -475,6 +454,7 @@ impl App {
         let instance = unsafe { GetModuleHandleW(None) }.map(HINSTANCE::from).unwrap_or_default();
         let preview_hwnd = preview::create_window(instance).inspect_err(|e| crate::log!("preview window failed: {e}")).unwrap_or_default();
         let flyout_hwnd = overflow::create_window(instance).inspect_err(|e| crate::log!("flyout window failed: {e}")).unwrap_or_default();
+        let menu_hwnd = menu::create_window(instance).inspect_err(|e| crate::log!("menu window failed: {e}")).unwrap_or_default();
         Self {
             hwnd,
             own_pid: unsafe { GetCurrentProcessId() },
@@ -487,6 +467,7 @@ impl App {
             surface,
             preview: preview::Preview::new(preview_hwnd),
             flyout: overflow::Flyout::new(flyout_hwnd),
+            menu: menu::Menu::new(menu_hwnd),
             origin: (0, 0),
             work: RECT::default(),
             render_failures: 0,
@@ -525,7 +506,6 @@ impl App {
             drag: None,
             dragging: None,
             dropped: None,
-            menu_open: false,
             hotkeys: Vec::new(),
             user_hidden: false,
             layout: Layout::default(),
@@ -751,7 +731,6 @@ impl App {
         };
         self.blur = self.cfg.appearance.blur && shell::transparency_enabled();
         self.palette = self.cfg.palette(dark, self.blur);
-        shell::set_menu_theme(self.cfg.appearance.theme);
         self.dirty = true;
     }
 
@@ -1363,7 +1342,7 @@ impl App {
                 self.anchor = u;
             }
         let targets = self.magnification_targets(hovering);
-        let lit = if hovering && self.drag.is_none() && !self.menu_open { self.hovered_index() } else { None };
+        let lit = if hovering && self.drag.is_none() && !self.menu.is_open() { self.hovered_index() } else { None };
         let tray_hover = lit.filter(|&i| self.items[i].kind == Kind::TrayIcon).map(|i| self.items[i].id.clone());
         if tray_hover != self.tray_hover {
             if let Some(icon) = tray_hover.as_deref().and_then(|id| self.tray_icon(id)) {
@@ -1430,7 +1409,7 @@ impl App {
         // Label: the hovered app's name, or a notice (e.g. a config error).
         let hovered = self
             .hovered_index()
-            .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id))
+            .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu.is_open() && !self.preview.showing(&self.items[i].id))
             // The status icons' label would show beneath the Quick Settings they opened.
             .filter(|&i| !(self.quick_settings_open && self.items[i].kind == Kind::Status))
             .filter(|&i| self.tray_clicked.as_deref() != Some(self.items[i].id.as_str()));
@@ -1698,6 +1677,8 @@ impl App {
                 self.close_preview();
                 self.flyout.reset_surface();
                 self.close_flyout();
+                self.menu.reset_surface();
+                self.close_menu();
                 self.dirty = true;
             }
             Err(e) => crate::log!("renderer init failed: {e}"),
@@ -1777,7 +1758,7 @@ impl App {
 
     fn on_leave(&mut self) {
         self.tracking = false;
-        if self.press.is_some() || self.drag.is_some() || self.menu_open {
+        if self.press.is_some() || self.drag.is_some() || self.menu.is_open() {
             return;
         }
         self.cursor = None;
@@ -1787,6 +1768,11 @@ impl App {
     }
 
     fn on_down(&mut self, x: f32, y: f32) {
+        // Clicking the dock doesn't take the focus from the menu either; like a Windows menu,
+        // the click that closes it does nothing else.
+        if self.close_menu().is_some() {
+            return;
+        }
         self.cursor = Some((x, y));
         let id = self.hovered_index().map(|i| self.items[i].id.clone());
         self.close_preview();
@@ -2027,49 +2013,47 @@ impl App {
 
     // ----------------------------------------------------------------- menu
 
-    /// The dock's menu for a right-click at (x, y), or None when the click opened another menu.
-    fn menu_spec(&mut self, x: f32, y: f32) -> Option<MenuSpec> {
+    /// Opens the dock's menu for a right-click at (x, y), or the menu the item has instead.
+    fn right_click(&mut self, x: f32, y: f32) {
         self.cursor = Some((x, y));
         self.close_preview();
         let idx = self.hovered_index();
         // Like the taskbar's Start button, right-click opens the Win+X menu.
-        match idx.map(|i| self.items[i].kind) {
-            Some(Kind::Start) => {
+        match idx.map(|i| (i, self.items[i].kind)) {
+            Some((_, Kind::Start)) => {
+                self.close_menu();
                 shell::open_power_menu();
-                return None;
+                return;
             }
-            Some(Kind::TrayIcon) => {
-                let id = self.items[idx?].id.clone();
+            Some((i, Kind::TrayIcon)) => {
+                self.close_menu();
+                let id = self.items[i].id.clone();
                 if let Some(icon) = self.tray_icon(&id) {
                     tray::click(icon, tray::Click::Right, cursor_pos());
                 }
                 self.tray_clicked = Some(id);
                 self.dirty = true;
-                return None;
+                return;
             }
-            Some(Kind::TrayOverflow) => {
+            Some((_, Kind::TrayOverflow)) => {
+                self.close_menu();
                 self.toggle_flyout();
-                return None;
+                return;
             }
             _ => {}
         }
         let mut entries = Vec::new();
         let mut windows = Vec::new();
-        if let Some(it) = idx.map(|i| &self.items[i]) {
+        let it = idx.map(|i| &self.items[i]);
+        if let Some(it) = it {
             // With several windows open, list them so any one is a click away.
             if it.windows.len() > 1 {
                 let fg = apps::foreground().0 as isize;
                 for (n, &w) in it.windows.iter().enumerate() {
-                    let mut title = apps::title(HWND(w as _));
-                    if title.chars().count() > 60 {
-                        title = title.chars().take(59).collect::<String>() + "…";
-                    }
-                    // `&` marks a keyboard shortcut in menus; `&&` is a literal ampersand.
-                    let label = title.replace('&', "&&");
-                    entries.push(MenuEntry { id: CMD_WINDOW + n as u32, label, checked: w == fg });
+                    entries.push(MenuEntry { id: CMD_WINDOW + n as u32, label: apps::title(HWND(w as _)), checked: w == fg });
                     windows.push(w);
                 }
-                entries.push(MenuEntry::separator());
+                MenuEntry::separate(&mut entries);
             }
             if it.launch.is_some() {
                 entries.push(MenuEntry::new(CMD_OPEN, if it.windows.is_empty() { "Open" } else { "New window" }));
@@ -2091,33 +2075,53 @@ impl App {
                     entries.push(MenuEntry::new(CMD_POWER, "Power & battery"));
                 }
             }
-            match it.windows.len() {
-                0 => {}
-                1 => entries.push(MenuEntry::new(CMD_CLOSE, "Close window")),
-                n => entries.push(MenuEntry::new(CMD_CLOSE, format!("Close all {n} windows"))),
+            // Last, like the taskbar's, so the bottom of an app's menu always closes the app.
+            if !it.windows.is_empty() {
+                MenuEntry::separate(&mut entries);
+                match it.windows.len() {
+                    1 => entries.push(MenuEntry::new(CMD_CLOSE, "Close window")),
+                    n => entries.push(MenuEntry::new(CMD_CLOSE, format!("Close all {n} windows"))),
+                }
             }
-            entries.push(MenuEntry::separator());
         }
-        if self.cfg.dock.hide_taskbar {
-            entries.push(MenuEntry::new(CMD_SHOW_DESKTOP, "Show desktop"));
+        // An app's menu is only about the app; the dock's own commands are on the rest of it.
+        if !it.is_some_and(|it| it.launch.is_some() || !it.windows.is_empty()) {
+            MenuEntry::separate(&mut entries);
+            if self.cfg.dock.hide_taskbar {
+                entries.push(MenuEntry::new(CMD_SHOW_DESKTOP, "Show desktop"));
+            }
+            entries.push(MenuEntry::new(CMD_IMPORT, "Import taskbar pins"));
+            entries.push(MenuEntry::new(CMD_SETTINGS, "Dock settings…"));
+            entries.push(MenuEntry::new(CMD_QUIT, "Quit Windock"));
         }
-        entries.push(MenuEntry::new(CMD_IMPORT, "Import taskbar pins"));
-        entries.push(MenuEntry::new(CMD_SETTINGS, "Dock settings…"));
-        entries.push(MenuEntry::new(CMD_QUIT, "Quit Windock"));
-        self.menu_open = true;
-        // The menu's loop stops the dock drawing; take the hover label away first.
-        self.render();
-        let align = self.menu_align();
-        Some(MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, windows, align })
+        // From the item's middle, or from the cursor on the dock itself.
+        let bar = self.m.margin + self.m.thick;
+        let (u, v) = match idx.and_then(|i| self.icon_uv(i)) {
+            Some((u0, u1, _, v1)) => ((u0 + u1) / 2.0, v1.max(bar)),
+            None => (self.cursor_uv().map_or(0.0, |(u, _)| u), bar),
+        };
+        let anchor = (u, v + 8.0 * self.m.s);
+        let item = idx.map(|i| self.items[i].id.clone());
+        self.open_menu(MenuSpec { item, entries, windows, anchor });
     }
 
-    fn menu_align(&self) -> TRACK_POPUP_MENU_FLAGS {
-        match self.cfg.dock.position {
-            Position::Bottom => TPM_BOTTOMALIGN | TPM_CENTERALIGN,
-            Position::Top => TPM_TOPALIGN | TPM_CENTERALIGN,
-            Position::Left => TPM_LEFTALIGN | TPM_VCENTERALIGN,
-            Position::Right => TPM_RIGHTALIGN | TPM_VCENTERALIGN,
-        }
+    /// Top-left screen corner for a w × h box opening from dock point (u, v) away from the
+    /// edge, centred on it and kept inside the work area.
+    fn place_beside(&self, u: f32, v: f32, w: f32, h: f32) -> (f32, f32) {
+        let (dx, dy) = self.axis.toward_edge(self.slide_distance());
+        let (ax, ay) = self.axis.xy(u, v);
+        let (ax, ay) = (self.origin.0 as f32 + ax + dx, self.origin.1 as f32 + ay + dy);
+        let (x, y) = match self.axis.pos {
+            Position::Bottom => (ax - w / 2.0, ay - h),
+            Position::Top => (ax - w / 2.0, ay),
+            Position::Left => (ax, ay - h / 2.0),
+            Position::Right => (ax - w, ay - h / 2.0),
+        };
+        let margin = 8.0 * self.m.s;
+        let wk = self.work;
+        let x = x.clamp(wk.left as f32 + margin, (wk.right as f32 - w - margin).max(wk.left as f32 + margin));
+        let y = y.clamp(wk.top as f32 + margin, (wk.bottom as f32 - h - margin).max(wk.top as f32 + margin));
+        (x, y)
     }
 
     fn tray_icon(&self, id: &str) -> Option<&tray::Icon> {
@@ -2168,9 +2172,6 @@ impl App {
     }
 
     fn menu_command(&mut self, spec: &MenuSpec, cmd: u32) {
-        self.menu_open = false;
-        self.cursor = None;
-        self.tracking = false;
         self.dirty = true;
         let idx = spec.item.as_ref().and_then(|id| self.items.iter().position(|it| &it.id == id && !it.dying));
         match (cmd, idx) {
@@ -2237,6 +2238,7 @@ impl App {
             WM_MOUSELEAVE => self.on_leave(),
             WM_LBUTTONDOWN => self.on_down(x, y),
             WM_LBUTTONUP => self.on_up(x, y),
+            WM_RBUTTONUP => self.right_click(x, y),
             WM_MBUTTONUP => {
                 self.cursor = Some((x, y));
                 match self.hovered_index() {
@@ -2273,7 +2275,7 @@ impl App {
                     preview::TIMER_PREVIEW => self.preview_timer(),
                     preview::TIMER_PREVIEW_CLOSE => self.close_preview(),
                     TIMER_HIDE => {
-                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() && !self.preview.is_open() && !self.flyout.is_open() {
+                        if self.cursor.is_none() && self.drag.is_none() && !self.menu.is_open() && self.notice.is_none() && !self.preview.is_open() && !self.flyout.is_open() {
                             self.hide_target = 1.0;
                             self.dirty = true;
                         }
@@ -2520,41 +2522,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         unsafe { PostQuitMessage(0) };
         return LRESULT(0);
     }
-    if msg == WM_RBUTTONUP {
-        let (x, y) = ((lp.0 & 0xffff) as i16 as f32, ((lp.0 >> 16) & 0xffff) as i16 as f32);
-        // The menu runs its own message loop, so the app must not stay borrowed while it's open.
-        if let Some(Some(spec)) = with_app(|a| a.menu_spec(x, y)) {
-            let cmd = unsafe { show_menu(hwnd, &spec) };
-            with_app(|a| a.menu_command(&spec, cmd));
-        }
-        return LRESULT(0);
-    }
     if let Some(Some(r)) = with_app(|a| a.handle(msg, wp, lp)) {
         return r;
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
-}
-
-unsafe fn show_menu(hwnd: HWND, spec: &MenuSpec) -> u32 {
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return 0 };
-        for e in &spec.entries {
-            if e.id == 0 {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            } else {
-                let text = wide(&e.label);
-                let flags = if e.checked { MF_STRING | MF_CHECKED } else { MF_STRING };
-                let _ = AppendMenuW(menu, flags, e.id as usize, PCWSTR(text.as_ptr()));
-            }
-        }
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | spec.align, pt.x, pt.y, None, hwnd, None);
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        cmd.0 as u32
-    }
 }
 
 pub fn run() -> Result<()> {

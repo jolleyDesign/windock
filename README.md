@@ -26,7 +26,8 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Click the focused app | Minimize it (or cycle through its windows, if it has several) |
 | Middle-click | Open a new window / instance |
 | Hover a running app | Live previews of its windows: click one to switch to it, **✕** or middle-click to close it |
-| Right-click | Pick a window (when there are several), Open, New window, Keep in dock / Remove from dock, Close windows, Import taskbar pins, Dock settings…, Quit |
+| Right-click an app | Pick a window (when there are several), Open / New window, Keep in dock / Remove from dock, and last, Close window(s) |
+| Right-click the dock between or beside the apps | Show desktop, Import taskbar pins, Dock settings…, Quit Windock (also under the clock's and status icons' entries) |
 | Drag an icon along the dock | Reorder pinned apps |
 | Drag an icon off the dock and release | Unpin it |
 | Drop files onto an app | Open them with that app |
@@ -44,7 +45,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 ## Configuration
 
 `%APPDATA%\Windock\config.toml` is created on first run with every option commented. Right-click
-the dock → **Dock settings…** opens it. Changes apply as soon as you save. If the file has an
+the dock beside the apps (or the clock) → **Dock settings…** opens it. Changes apply as soon as you save. If the file has an
 error, the dock shows it and keeps the last good settings.
 
 ```toml
@@ -140,6 +141,7 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | `src/app.rs` | The dock window: layout, magnification, input, drag & drop, auto-hide, animation loop |
 | `src/app/preview.rs` | The hover popup with live DWM window thumbnails |
 | `src/app/overflow.rs` | The grid of hidden tray icons that opens from the arrow |
+| `src/app/menu.rs` | The right-click menu, drawn like the dock |
 | `src/app/droptarget.rs` | Files dragged onto the dock: open with an app, or pin |
 | `src/clock.rs` | The clock's text, formatted by Windows |
 | `src/tray.rs` | Other apps' tray icons: a stand-in `Shell_TrayWnd` that keeps a copy and passes everything on to Explorer |
