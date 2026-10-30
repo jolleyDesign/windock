@@ -77,6 +77,19 @@ pub struct LabelDraw {
     pub pad: (f32, f32),
 }
 
+/// Text with no background, centred in `rect`, in the clock font.
+pub struct TextDraw {
+    pub rect: RectF,
+    pub text: String,
+    pub color: Color,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Font {
+    Label,
+    Clock,
+}
+
 pub struct Frame<'a> {
     /// Offset of the whole window's content (used to slide the dock away when auto-hiding).
     pub offset: (f32, f32),
@@ -90,6 +103,7 @@ pub struct Frame<'a> {
     pub shapes: Vec<Shape>,
     pub icons: Vec<IconDraw<'a>>,
     pub labels: Vec<LabelDraw>,
+    pub texts: Vec<TextDraw>,
 }
 
 /// The composition target and drawing surface for one window.
@@ -122,6 +136,16 @@ impl Surface {
 }
 
 /// Device-level state shared by every surface.
+/// Font, text, and the layout box's width and height.
+type LayoutKey = (Font, String, u32, u32);
+
+/// Per-frame resources, made before drawing starts.
+struct Prepared {
+    bitmaps: Vec<Option<ID2D1Bitmap1>>,
+    labels: Vec<Option<IDWriteTextLayout>>,
+    texts: Vec<Option<IDWriteTextLayout>>,
+}
+
 pub struct Gpu {
     compositor: Compositor,
     graphics: CompositionGraphicsDevice,
@@ -129,7 +153,8 @@ pub struct Gpu {
     brush: ID2D1SolidColorBrush,
     dwrite: IDWriteFactory,
     label_format: Option<IDWriteTextFormat>,
-    layouts: HashMap<(String, u32), (IDWriteTextLayout, f32, f32)>,
+    clock_format: Option<IDWriteTextFormat>,
+    layouts: HashMap<LayoutKey, (IDWriteTextLayout, f32, f32)>,
     bitmaps: HashMap<String, ID2D1Bitmap1>,
 }
 
@@ -185,6 +210,7 @@ impl Gpu {
                 brush,
                 dwrite: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
                 label_format: None,
+                clock_format: None,
                 layouts: HashMap::new(),
                 bitmaps: HashMap::new(),
             })
@@ -254,19 +280,37 @@ impl Gpu {
         };
     }
 
-    fn layout(&mut self, text: &str, max_width: f32) -> Option<&(IDWriteTextLayout, f32, f32)> {
-        let key = (text.to_string(), max_width.max(1.0) as u32);
+    /// Lines centred both ways, so the clock's time and date line up whatever their widths.
+    pub fn set_clock_font(&mut self, family: &str, size_px: f32) {
+        self.layouts.retain(|k, _| k.0 != Font::Clock);
+        self.clock_format = unsafe {
+            self.dwrite
+                .CreateTextFormat(&HSTRING::from(family), None, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size_px, w!(""))
+                .inspect(|f| {
+                    let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                })
+                .ok()
+        };
+    }
+
+    fn layout(&mut self, font: Font, text: &str, max_width: f32, height: f32) -> Option<&(IDWriteTextLayout, f32, f32)> {
+        let key = (font, text.to_string(), max_width.max(1.0) as u32, height.max(1.0) as u32);
         if !self.layouts.contains_key(&key) {
             if self.layouts.len() > 128 {
                 self.layouts.clear();
             }
-            let format = self.label_format.as_ref()?;
+            let format = match font {
+                Font::Label => self.label_format.as_ref()?,
+                Font::Clock => self.clock_format.as_ref()?,
+            };
             let utf16: Vec<u16> = text.encode_utf16().collect();
             unsafe {
-                let layout = self.dwrite.CreateTextLayout(&utf16, format, key.1 as f32, 1000.0).ok()?;
+                let layout = self.dwrite.CreateTextLayout(&utf16, format, key.2 as f32, key.3 as f32).ok()?;
                 let mut m = DWRITE_TEXT_METRICS::default();
                 layout.GetMetrics(&mut m).ok()?;
-                let w = m.widthIncludingTrailingWhitespace.min(key.1 as f32).ceil();
+                let w = m.widthIncludingTrailingWhitespace.min(key.2 as f32).ceil();
                 self.layouts.insert(key.clone(), (layout, w, m.height.ceil()));
             }
         }
@@ -275,7 +319,11 @@ impl Gpu {
 
     /// Size of `text` in the label font, in pixels, trimmed to `max_width`.
     pub fn measure(&mut self, text: &str, max_width: f32) -> Option<(f32, f32)> {
-        self.layout(text, max_width).map(|(_, w, h)| (*w, *h))
+        self.layout(Font::Label, text, max_width, 1000.0).map(|(_, w, h)| (*w, *h))
+    }
+
+    pub fn measure_clock(&mut self, text: &str) -> Option<(f32, f32)> {
+        self.layout(Font::Clock, text, 4000.0, 1000.0).map(|(_, w, h)| (*w, *h))
     }
 
     pub fn clear_bitmaps(&mut self) {
@@ -320,9 +368,11 @@ impl Gpu {
             s.backdrop_shape.SetCornerRadius(Vector2 { X: f.bar_radius, Y: f.bar_radius })?;
         }
 
-        let bitmaps: Vec<Option<ID2D1Bitmap1>> = f.icons.iter().map(|i| self.bitmap(i.source, pixels)).collect();
-        let layouts: Vec<Option<IDWriteTextLayout>> =
-            f.labels.iter().map(|l| self.layout(&l.text, l.max_width).map(|(t, _, _)| t.clone())).collect();
+        let prepared = Prepared {
+            bitmaps: f.icons.iter().map(|i| self.bitmap(i.source, pixels)).collect(),
+            labels: f.labels.iter().map(|l| self.layout(Font::Label, &l.text, l.max_width, 1000.0).map(|(t, _, _)| t.clone())).collect(),
+            texts: f.texts.iter().map(|t| self.layout(Font::Clock, &t.text, t.rect.w(), t.rect.h()).map(|(l, _, _)| l.clone())).collect(),
+        };
 
         // Only redraw what changed: this frame's content plus whatever was drawn last frame.
         let bounds = f
@@ -331,6 +381,7 @@ impl Gpu {
             .map(|i| i.rect)
             .chain(f.shapes.iter().map(|s| s.rect))
             .chain(f.labels.iter().map(|l| l.rect))
+            .chain(f.texts.iter().map(|t| t.rect))
             .chain(std::iter::once(f.bar).filter(|b| b.w() > 0.0))
             .reduce(|a, b| RectF { l: a.l.min(b.l), t: a.t.min(b.t), r: a.r.max(b.r), b: a.b.max(b.b) })
             .map(|r| r.inflate(2.0));
@@ -353,7 +404,7 @@ impl Gpu {
 
         let mut offset = POINT::default();
         let dc: ID2D1DeviceContext = unsafe { s.surface.BeginDraw(Some(&update), &mut offset)? };
-        self.paint(&dc, f, &bitmaps, &layouts, offset, update);
+        self.paint(&dc, f, &prepared, offset, update);
         unsafe { s.surface.EndDraw()? };
         s.drawn = current;
         Ok(())
@@ -371,8 +422,7 @@ impl Gpu {
         &self,
         dc: &ID2D1DeviceContext,
         f: &Frame,
-        bitmaps: &[Option<ID2D1Bitmap1>],
-        layouts: &[Option<IDWriteTextLayout>],
+        p: &Prepared,
         at: POINT,
         update: RECT,
     ) {
@@ -395,7 +445,7 @@ impl Gpu {
             for s in &f.shapes {
                 self.fill(dc, s.rect, s.radius, s.color);
             }
-            for (icon, bmp) in f.icons.iter().zip(bitmaps) {
+            for (icon, bmp) in f.icons.iter().zip(&p.bitmaps) {
                 match bmp {
                     Some(b) => dc.DrawBitmap(
                         b,
@@ -408,13 +458,18 @@ impl Gpu {
                     None => self.fill(dc, icon.rect.inflate(-icon.rect.w() * 0.08), icon.rect.w() * 0.22, f.placeholder.alpha(icon.opacity * 0.7)),
                 }
             }
-            for (l, layout) in f.labels.iter().zip(layouts) {
+            for (l, layout) in f.labels.iter().zip(&p.labels) {
                 let Some(layout) = layout else { continue };
                 if l.bg.a > 0.0 {
                     self.fill(dc, l.rect, l.radius, l.bg);
                 }
                 self.brush.SetColor(&color(l.fg));
                 dc.DrawTextLayout(Vector2 { X: l.rect.l + l.pad.0, Y: l.rect.t + l.pad.1 }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+            for (t, layout) in f.texts.iter().zip(&p.texts) {
+                let Some(layout) = layout else { continue };
+                self.brush.SetColor(&color(t.color));
+                dc.DrawTextLayout(Vector2 { X: t.rect.l, Y: t.rect.t }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
             dc.PopAxisAlignedClip();
         }

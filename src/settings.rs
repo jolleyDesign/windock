@@ -1,7 +1,8 @@
 //! The settings window (`windock.exe --settings`). It edits config.toml; the running dock
 //! reloads the file, so every change shows up live.
 
-use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Pinned, Position, Theme};
+use crate::clock;
+use crate::config::{self, Color, Config, DateStyle, IndicatorStyle, MonitorSel, Pinned, Position, Show, Theme};
 use crate::hotkeys;
 use crate::shell;
 use crate::softgui;
@@ -46,6 +47,7 @@ pub fn run() {
 enum Tab {
     General,
     Appearance,
+    Clock,
     Apps,
 }
 
@@ -64,6 +66,8 @@ struct Settings {
     tab: Tab,
     monitors: Vec<String>,
     names: HashMap<String, String>,
+    /// "Custom" picked for the time, even while its pattern matches a preset.
+    custom_time: bool,
 }
 
 impl Settings {
@@ -100,6 +104,7 @@ impl Settings {
             tab: Tab::General,
             monitors,
             names: HashMap::new(),
+            custom_time: false,
         };
         s.adopt(parsed);
         s
@@ -317,13 +322,8 @@ impl Settings {
 
         section(ui, "Colours");
         ui.label(egui::RichText::new("Unticked colours follow the theme.").weak());
-        let dark = match self.cfg.appearance.theme {
-            Theme::Auto => shell::system_dark_mode(),
-            Theme::Dark => true,
-            Theme::Light => false,
-        };
         let theme = Config { appearance: config::Appearance { ..Default::default() }, ..Default::default() }
-            .palette(dark, self.cfg.appearance.blur);
+            .palette(self.dark(), self.cfg.appearance.blur);
         let a = &mut self.cfg.appearance;
         grid(ui, "colours", |ui| {
             let slots: [(&str, &mut Option<Color>, Color); 7] = [
@@ -350,6 +350,112 @@ impl Settings {
                 ui.end_row();
             }
         });
+        c
+    }
+
+    fn dark(&self) -> bool {
+        match self.cfg.appearance.theme {
+            Theme::Auto => shell::system_dark_mode(),
+            Theme::Dark => true,
+            Theme::Light => false,
+        }
+    }
+
+    fn clock(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut c = false;
+        let taskbar_hidden = self.cfg.dock.hide_taskbar;
+        let theme_colour = Config { clock: Default::default(), ..self.cfg.clone() }.palette(self.dark(), self.cfg.appearance.blur).clock;
+        let k = &mut self.cfg.clock;
+
+        section(ui, "Clock");
+        grid(ui, "clock", |ui| {
+            ui.label("Show");
+            ui.horizontal(|ui| {
+                for (s, label) in [(Show::Auto, "Automatically"), (Show::Always, "Always"), (Show::Never, "Never")] {
+                    c |= ui.selectable_value(&mut k.show, s, label).changed();
+                }
+            });
+            ui.end_row();
+
+            const TIME_PRESETS: [(&str, &str); 3] = [("", "Windows format"), ("HH:mm", "24-hour"), ("h:mm tt", "12-hour")];
+            let custom = self.custom_time || !TIME_PRESETS.iter().any(|(p, _)| *p == k.time);
+            ui.label("Time");
+            ui.horizontal(|ui| {
+                for (p, label) in TIME_PRESETS {
+                    if ui.selectable_label(!custom && k.time == p, label).clicked() {
+                        k.time = p.into();
+                        self.custom_time = false;
+                        c = true;
+                    }
+                }
+                if ui.selectable_label(custom, "Custom").clicked() && !custom {
+                    self.custom_time = true;
+                    if k.time.is_empty() {
+                        k.time = "HH:mm".into();
+                        c = true;
+                    }
+                }
+            });
+            ui.end_row();
+            if custom {
+                ui.label("");
+                c |= pattern_field(ui, &mut k.time, "HH:mm  ·  h:mm tt  ·  H.mm");
+                ui.end_row();
+            }
+
+            ui.label("Date");
+            ui.horizontal(|ui| {
+                let is_custom = matches!(k.date, DateStyle::Custom(_));
+                for (d, label) in [(DateStyle::None, "None"), (DateStyle::Short, "Short"), (DateStyle::Long, "Long")] {
+                    c |= ui.selectable_value(&mut k.date, d, label).changed();
+                }
+                if ui.selectable_label(is_custom, "Custom").clicked() && !is_custom {
+                    k.date = DateStyle::Custom("ddd d MMM".into());
+                    c = true;
+                }
+            });
+            ui.end_row();
+            if let DateStyle::Custom(pattern) = &mut k.date {
+                ui.label("");
+                c |= pattern_field(ui, pattern, "ddd d MMM  ·  dd/MM/yyyy  ·  MMMM d");
+                ui.end_row();
+            }
+            c |= slider(ui, "Text size", &mut k.size, 8.0..=24.0, " px");
+
+            let mut custom_colour = k.color.is_some();
+            if ui.checkbox(&mut custom_colour, "Text colour").changed() {
+                k.color = custom_colour.then_some(theme_colour);
+                c = true;
+            }
+            let mut rgba = to_rgba(k.color.unwrap_or(theme_colour));
+            if ui.add_enabled_ui(custom_colour, |ui| ui.color_edit_button_srgba_unmultiplied(&mut rgba)).inner.changed() {
+                k.color = Some(Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]));
+                c = true;
+            }
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        c |= toggle(ui, &mut k.seconds, "Show seconds", "");
+
+        ui.add_space(10.0);
+        let face = clock::now(k);
+        let preview = match &face.date {
+            Some(d) => format!("{}   {d}", face.time),
+            None => face.time.clone(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Preview").weak());
+            ui.label(egui::RichText::new(preview).strong());
+        });
+        let note = match k.show {
+            Show::Auto if !taskbar_hidden => "Hidden for now: it appears while the Windows taskbar is hidden (General › Hide the Windows taskbar).",
+            Show::Auto => "Shown because the Windows taskbar is hidden.",
+            _ => "",
+        };
+        if !note.is_empty() {
+            ui.label(egui::RichText::new(note).weak());
+        }
+        ui.label(egui::RichText::new("Click the clock for notifications and the calendar. Patterns use Windows' format letters.").weak());
         c
     }
 
@@ -416,7 +522,7 @@ impl softgui::App for Settings {
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                for (t, label) in [(Tab::General, "General"), (Tab::Appearance, "Appearance"), (Tab::Apps, "Apps")] {
+                for (t, label) in [(Tab::General, "General"), (Tab::Appearance, "Appearance"), (Tab::Clock, "Clock"), (Tab::Apps, "Apps")] {
                     ui.selectable_value(&mut self.tab, t, egui::RichText::new(label).size(15.0));
                 }
             });
@@ -465,6 +571,7 @@ impl softgui::App for Settings {
                     let changed = match self.tab {
                         Tab::General => self.general(ui),
                         Tab::Appearance => self.appearance(ui),
+                        Tab::Clock => self.clock(ui),
                         Tab::Apps => self.apps(ui),
                     };
                     if changed {
@@ -540,6 +647,11 @@ fn section(ui: &mut egui::Ui, title: &str) {
 
 fn grid(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
     egui::Grid::new(id).num_columns(2).spacing([24.0, 8.0]).min_col_width(140.0).show(ui, body);
+}
+
+/// A date or time pattern, with examples shown while it's empty.
+fn pattern_field(ui: &mut egui::Ui, value: &mut String, examples: &str) -> bool {
+    ui.add(egui::TextEdit::singleline(value).hint_text(examples).desired_width(220.0)).changed()
 }
 
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str) -> bool {

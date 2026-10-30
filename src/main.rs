@@ -2,6 +2,7 @@
 
 mod app;
 mod apps;
+mod clock;
 mod config;
 mod hotkeys;
 mod icons;

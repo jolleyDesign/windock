@@ -359,6 +359,7 @@ impl App {
         }
         let p = &self.preview;
         let frame = Frame {
+            texts: Vec::new(),
             offset: (0.0, 0.0),
             bar: RectF::new(0.0, 0.0, p.size.0, p.size.1),
             bar_radius: 12.0 * s,

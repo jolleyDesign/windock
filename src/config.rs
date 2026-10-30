@@ -250,6 +250,79 @@ impl Default for Shortcuts {
     }
 }
 
+/// When an optional part of the dock appears.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Show {
+    /// Only while the Windows taskbar is hidden, since it has its own.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+/// "none", "short" and "long" follow Windows' regional formats; anything else is a pattern.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(from = "String", into = "String")]
+pub enum DateStyle {
+    None,
+    #[default]
+    Short,
+    Long,
+    Custom(String),
+}
+
+impl From<String> for DateStyle {
+    fn from(s: String) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "" | "none" => DateStyle::None,
+            "short" => DateStyle::Short,
+            "long" => DateStyle::Long,
+            _ => DateStyle::Custom(s),
+        }
+    }
+}
+
+impl From<DateStyle> for String {
+    fn from(d: DateStyle) -> Self {
+        match d {
+            DateStyle::None => "none".into(),
+            DateStyle::Short => "short".into(),
+            DateStyle::Long => "long".into(),
+            DateStyle::Custom(s) => s,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Clock {
+    pub show: Show,
+    /// "" for Windows' regional format, or a pattern like "HH:mm" or "h:mm tt".
+    pub time: String,
+    pub seconds: bool,
+    pub date: DateStyle,
+    pub size: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self { show: Show::Auto, time: String::new(), seconds: false, date: DateStyle::Short, size: 12.0, color: None }
+    }
+}
+
+impl Config {
+    pub fn shows_clock(&self) -> bool {
+        match self.clock.show {
+            Show::Auto => self.dock.hide_taskbar,
+            Show::Always => true,
+            Show::Never => false,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 pub struct Pinned {
     pub path: String,
@@ -269,6 +342,7 @@ pub struct Config {
     pub magnification: Magnification,
     pub animation: Animation,
     pub shortcuts: Shortcuts,
+    pub clock: Clock,
     pub pinned: Vec<Pinned>,
 }
 
@@ -284,6 +358,7 @@ pub struct Palette {
     pub label_bg: Color,
     pub label_text: Color,
     pub placeholder: Color,
+    pub clock: Color,
 }
 
 impl Config {
@@ -297,6 +372,7 @@ impl Config {
         a.edge_margin = a.edge_margin.clamp(0.0, 200.0);
         a.corner_radius = a.corner_radius.max(0.0);
         a.label_size = a.label_size.clamp(6.0, 48.0);
+        self.clock.size = self.clock.size.clamp(6.0, 48.0);
         let m = &mut self.magnification;
         m.scale = m.scale.clamp(1.0, 4.0);
         m.range = m.range.clamp(1.0, 10.0);
@@ -318,6 +394,7 @@ impl Config {
                 label_bg: Color::rgba(0x2a, 0x2a, 0x2d, 0xf2),
                 label_text: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
                 placeholder: Color::rgba(0x5a, 0x5a, 0x60, 0xff),
+                clock: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
             }
         } else {
             Palette {
@@ -330,6 +407,7 @@ impl Config {
                 label_bg: Color::rgba(0xfb, 0xfb, 0xfd, 0xf5),
                 label_text: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
                 placeholder: Color::rgba(0xb8, 0xb8, 0xc0, 0xff),
+                clock: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
             }
         };
         Palette {
@@ -342,6 +420,7 @@ impl Config {
             label_bg: a.label_background.unwrap_or(def.label_bg),
             label_text: a.label_text.unwrap_or(def.label_text),
             placeholder: def.placeholder,
+            clock: self.clock.color.unwrap_or(def.clock),
         }
     }
 }
@@ -383,7 +462,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
-    for section in ["dock", "appearance", "magnification", "animation", "shortcuts"] {
+    for section in ["dock", "appearance", "magnification", "animation", "shortcuts", "clock"] {
         let Some(values) = fresh.get(section).and_then(|i| i.as_table()) else { continue };
         if !doc.contains_table(section) {
             doc[section] = toml_edit::table();
@@ -405,7 +484,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
     write_document(path, &doc)
 }
 
-const OPTIONAL_KEYS: [&str; 10] = [
+const OPTIONAL_KEYS: [&str; 11] = [
     "padding",
     "padding_x",
     "padding_y",
@@ -416,6 +495,7 @@ const OPTIONAL_KEYS: [&str; 10] = [
     "attention_color",
     "label_background",
     "label_text",
+    "color",
 ];
 
 fn read_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
@@ -579,6 +659,14 @@ bounce_on_launch = true
 # On keyboards with an AltGr key, Ctrl+Alt also types characters like @; use "win+ctrl+alt".
 open_app = "ctrl+alt"
 toggle_dock = "win+shift+d"  # show or hide the dock; "" turns it off
+
+[clock]
+show = "auto"                # auto (while the Windows taskbar is hidden) | always | never
+time = ""                    # "" follows Windows; or a pattern like "HH:mm" (24-hour) or "h:mm tt"
+seconds = false
+date = "short"               # none | short | long, or a pattern like "ddd d MMM"
+size = 12
+# color = "#f5f5f7"          # leave out to follow the theme
 "##;
 
 const PINNED_COMMENT: &str = r"

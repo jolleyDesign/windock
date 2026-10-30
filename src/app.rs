@@ -4,9 +4,10 @@ mod droptarget;
 mod preview;
 
 use crate::apps::{self, AppKey};
+use crate::clock;
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
 use crate::icons::{IconLoader, IconPixels};
-use crate::render::{Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface};
+use crate::render::{Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
 use crate::hotkeys;
 use crate::shell;
 use crate::taskbar;
@@ -45,6 +46,8 @@ const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
 const TIMER_HIDE: usize = 3;
 const TIMER_NOTICE: usize = 4;
+// 5 and 6 are the preview's.
+const TIMER_CLOCK: usize = 7;
 
 /// Hotkey ids: HOTKEY_APP + n opens pinned app n (0-based); HOTKEY_TOGGLE shows/hides the dock.
 const HOTKEY_APP: i32 = 1;
@@ -57,6 +60,8 @@ const CMD_CLOSE: u32 = 4;
 const CMD_SETTINGS: u32 = 5;
 const CMD_QUIT: u32 = 6;
 const CMD_IMPORT: u32 = 7;
+const CMD_NOTIFICATIONS: u32 = 8;
+const CMD_DATE_TIME: u32 = 9;
 /// Menu ids from here up pick a window: CMD_WINDOW + index into `MenuSpec::windows`.
 const CMD_WINDOW: u32 = 100;
 
@@ -96,6 +101,7 @@ enum Kind {
     Pinned(usize),
     Running,
     Separator,
+    Clock,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +150,11 @@ impl Item {
 
     fn interactive(&self) -> bool {
         !self.dying && self.kind != Kind::Separator
+    }
+
+    /// An app icon, as opposed to the clock or a separator.
+    fn is_app(&self) -> bool {
+        matches!(self.kind, Kind::Pinned(_) | Kind::Running)
     }
 }
 
@@ -340,6 +351,10 @@ pub struct App {
     names: HashMap<String, String>,
     items: Vec<Item>,
     first_build: bool,
+    /// The clock's lines, its hover text, and its length along the dock.
+    clock_text: String,
+    clock_tip: String,
+    clock_len: f32,
 
     cursor: Option<(f32, f32)>,
     tracking: bool,
@@ -419,6 +434,9 @@ impl App {
             names: HashMap::new(),
             items: Vec::new(),
             first_build: true,
+            clock_text: String::new(),
+            clock_tip: String::new(),
+            clock_len: 0.0,
             cursor: None,
             tracking: false,
             anchor: 0.0,
@@ -704,9 +722,7 @@ impl App {
         if let Some(sf) = &mut self.surface {
             let _ = sf.resize(w as u32, h as u32);
         }
-        if let Some(g) = &mut self.gpu {
-            g.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * s);
-        }
+        self.set_fonts();
 
         // Load icons at the largest size they'll be drawn.
         let px = (((self.m.icon * self.m.mag).ceil() as u32).div_ceil(16) * 16).clamp(32, 256);
@@ -991,6 +1007,12 @@ impl App {
             items.push(Item::new("sep".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
         }
         items.extend(running);
+        if self.cfg.shows_clock() {
+            if !items.is_empty() {
+                items.push(Item::new("sep:clock".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
+            }
+            items.push(Item::new("clock".into(), Kind::Clock, self.clock_tip.clone(), String::new(), AppKey::default(), None));
+        }
 
         // Carry animation state across rebuilds; new items grow in, removed ones shrink out.
         let old = std::mem::take(&mut self.items);
@@ -1026,7 +1048,7 @@ impl App {
 
     fn request_icons(&mut self) {
         for it in &self.items {
-            if it.kind != Kind::Separator && !it.icon.is_empty() && !self.icons.contains_key(&it.icon) {
+            if it.is_app() && !it.icon.is_empty() && !self.icons.contains_key(&it.icon) {
                 self.loader.request(&it.icon, self.icon_px);
             }
         }
@@ -1041,8 +1063,13 @@ impl App {
 
     // --------------------------------------------------------------- layout
 
+    /// Length along the dock, before magnification.
     fn base_size(&self, it: &Item) -> f32 {
-        if it.kind == Kind::Separator { self.m.sep } else { self.m.icon }
+        match it.kind {
+            Kind::Separator => self.m.sep,
+            Kind::Clock => self.clock_len,
+            Kind::Pinned(_) | Kind::Running => self.m.icon,
+        }
     }
 
     /// Lays icons out at their current magnification, anchored so the point under the
@@ -1111,6 +1138,10 @@ impl App {
     fn icon_uv(&self, i: usize) -> Option<(f32, f32, f32, f32)> {
         let (it, s) = (self.items.get(i)?, self.layout.slots.get(i)?);
         let cu = s.center + it.shift;
+        if it.kind == Kind::Clock {
+            // Text gets the whole thickness of the dock, so two lines fit beside small icons.
+            return Some((cu - s.size / 2.0, cu + s.size / 2.0, self.m.margin, self.m.margin + self.m.thick));
+        }
         let v0 = self.m.margin + self.m.pad_cross + self.lift(it);
         Some((cu - s.size / 2.0, cu + s.size / 2.0, v0, v0 + s.size))
     }
@@ -1202,7 +1233,7 @@ impl App {
                 let w = it.appear * (self.base_size(it) + m.gap);
                 let center = u + w / 2.0;
                 u += w;
-                if !ok || it.kind == Kind::Separator {
+                if !ok || !it.is_app() {
                     return 1.0;
                 }
                 let d = (cu - center).abs() / (m.icon + m.gap);
@@ -1249,6 +1280,7 @@ impl App {
 
         let mut shapes = Vec::new();
         let mut icons = Vec::new();
+        let mut texts = Vec::new();
         let drag_id = self.drag.as_ref().map(|d| d.id.as_str());
         for (i, it) in self.items.iter().enumerate() {
             let Some(slot) = self.layout.slots.get(i) else { continue };
@@ -1260,6 +1292,12 @@ impl App {
                     radius: t / 2.0,
                     color: pal.separator.alpha(it.appear),
                 });
+                continue;
+            }
+            if it.kind == Kind::Clock {
+                if let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
+                    texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: self.clock_text.clone(), color: pal.clock.alpha(it.appear) });
+                }
                 continue;
             }
             if drag_id != Some(it.id.as_str())
@@ -1315,6 +1353,7 @@ impl App {
             shapes,
             icons,
             labels: label.into_iter().collect(),
+            texts,
         };
         if let (Some(g), Some(sf)) = (&mut self.gpu, &mut self.surface) {
             match g.draw(sf, &frame, &self.icons) {
@@ -1335,16 +1374,63 @@ impl App {
         self.update_region(region, offset);
     }
 
+    fn set_fonts(&mut self) {
+        let (a, s) = (&self.cfg.appearance, self.m.s);
+        if let Some(g) = &mut self.gpu {
+            g.set_label_font(&a.label_font, a.label_size * s);
+            g.set_clock_font(&a.label_font, self.cfg.clock.size * s);
+        }
+        self.update_clock();
+    }
+
+    // ----------------------------------------------------------------- clock
+
+    /// Reads the time, measures it, and sets a timer for when it next changes.
+    fn update_clock(&mut self) {
+        self.kill_timer(TIMER_CLOCK);
+        if !self.cfg.shows_clock() {
+            return;
+        }
+        let face = clock::now(&self.cfg.clock);
+        let m = self.m;
+        let horizontal = self.axis.horizontal();
+        let mut text = match &face.date {
+            Some(d) => format!("{}\n{d}", face.time),
+            None => face.time.clone(),
+        };
+        let mut len = m.icon;
+        if let Some(g) = &mut self.gpu {
+            let mut size = g.measure_clock(&text).unwrap_or_default();
+            // Across a side dock there's only its thickness; keep the time and drop the date.
+            if !horizontal && face.date.is_some() && size.0 > m.thick - 8.0 * m.s {
+                text = face.time.clone();
+                size = g.measure_clock(&text).unwrap_or_default();
+            }
+            len = if horizontal { size.0 + 8.0 * m.s } else { size.1 + 4.0 * m.s };
+        }
+        if text != self.clock_text || len != self.clock_len || face.tooltip != self.clock_tip {
+            self.clock_text = text;
+            self.clock_len = len;
+            self.clock_tip = face.tooltip;
+            if let Some(it) = self.items.iter_mut().find(|it| it.kind == Kind::Clock) {
+                it.name = self.clock_tip.clone();
+            }
+            self.layout = self.compute_layout();
+            self.dirty = true;
+        }
+        self.set_timer(TIMER_CLOCK, face.next_change.as_millis() as u32 + 15);
+    }
+
     fn recreate_renderer(&mut self) {
         let made = Gpu::new(self.cfg.dock.gpu).and_then(|g| {
             let sf = g.create_surface(self.hwnd, self.axis.w as u32, self.axis.h as u32)?;
             Ok((g, sf))
         });
         match made {
-            Ok((mut g, sf)) => {
-                g.set_label_font(&self.cfg.appearance.label_font, self.cfg.appearance.label_size * self.m.s);
+            Ok((g, sf)) => {
                 self.gpu = Some(g);
                 self.surface = Some(sf);
+                self.set_fonts();
                 self.preview.reset_surface();
                 self.close_preview();
                 self.dirty = true;
@@ -1463,6 +1549,10 @@ impl App {
     }
 
     fn click(&mut self, i: usize) {
+        if self.items[i].kind == Kind::Clock {
+            shell::launch("ms-actioncenter:", None, None);
+            return;
+        }
         let wins = self.items[i].windows.clone();
         if wins.is_empty() {
             self.launch(i);
@@ -1603,6 +1693,10 @@ impl App {
                 Kind::Running if it.launch.is_some() => entries.push(MenuEntry::new(CMD_PIN, "Keep in dock")),
                 _ => {}
             }
+            if it.kind == Kind::Clock {
+                entries.push(MenuEntry::new(CMD_NOTIFICATIONS, "Notifications and calendar"));
+                entries.push(MenuEntry::new(CMD_DATE_TIME, "Adjust date and time"));
+            }
             match it.windows.len() {
                 0 => {}
                 1 => entries.push(MenuEntry::new(CMD_CLOSE, "Close window")),
@@ -1656,6 +1750,12 @@ impl App {
                 self.show_notice(text, INFO_TIME);
             }
             (CMD_SETTINGS, _) => open_settings(),
+            (CMD_NOTIFICATIONS, _) => {
+                shell::launch("ms-actioncenter:", None, None);
+            }
+            (CMD_DATE_TIME, _) => {
+                shell::launch("ms-settings:dateandtime", None, None);
+            }
             (c, _) if c >= CMD_WINDOW => {
                 if let Some(&w) = spec.windows.get((c - CMD_WINDOW) as usize) {
                     apps::activate(HWND(w as _));
@@ -1706,6 +1806,7 @@ impl App {
                             self.dirty = true;
                         }
                     }
+                    TIMER_CLOCK => self.update_clock(),
                     TIMER_NOTICE => {
                         self.notice = None;
                         self.dirty = true;
@@ -1741,11 +1842,16 @@ impl App {
             // Signing out: put the taskbar's auto-hide setting back, as quitting would.
             WM_ENDSESSION if wp.0 != 0 => taskbar::restore(),
             WM_DISPLAYCHANGE | WM_DPICHANGED => self.place(),
+            WM_TIMECHANGE => self.update_clock(),
             WM_SETTINGCHANGE => {
+                let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as _).to_string() }.unwrap_or_default() } else { String::new() };
                 if wp.0 as u32 == SPI_SETWORKAREA.0 {
                     self.place();
-                } else if lp.0 != 0 && unsafe { PCWSTR(lp.0 as _).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet") {
+                } else if area == "ImmersiveColorSet" {
                     self.apply_theme();
+                } else if area == "intl" {
+                    // Regional formats changed.
+                    self.update_clock();
                 }
                 return None;
             }
