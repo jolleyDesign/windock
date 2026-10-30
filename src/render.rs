@@ -101,6 +101,8 @@ pub struct Frame<'a> {
     pub bar_radius: f32,
     pub bar_fill: Color,
     pub bar_border: Color,
+    /// A second bar styled like `bar` (the corner island for the clock and status icons).
+    pub island: Option<RectF>,
     pub blur: bool,
     pub placeholder: Color,
     pub shapes: Vec<Shape>,
@@ -115,6 +117,8 @@ pub struct Surface {
     root: ContainerVisual,
     backdrop: SpriteVisual,
     backdrop_shape: CompositionRoundedRectangleGeometry,
+    island_backdrop: SpriteVisual,
+    island_shape: CompositionRoundedRectangleGeometry,
     content: SpriteVisual,
     surface: ICompositionDrawingSurfaceInterop,
     size: (u32, u32),
@@ -231,11 +235,16 @@ impl Gpu {
 
             // Frosted glass: DWM's blurred view of whatever is behind the window,
             // clipped to the background's rounded rectangle.
-            let backdrop = c.CreateSpriteVisual()?;
-            backdrop.SetBrush(&c.CreateHostBackdropBrush()?)?;
-            let backdrop_shape = c.CreateRoundedRectangleGeometry()?;
-            backdrop.SetClip(&c.CreateGeometricClipWithGeometry(&backdrop_shape)?)?;
-            root.Children()?.InsertAtTop(&backdrop)?;
+            let frosted = || -> Result<(SpriteVisual, CompositionRoundedRectangleGeometry)> {
+                let visual = c.CreateSpriteVisual()?;
+                visual.SetBrush(&c.CreateHostBackdropBrush()?)?;
+                let shape = c.CreateRoundedRectangleGeometry()?;
+                visual.SetClip(&c.CreateGeometricClipWithGeometry(&shape)?)?;
+                root.Children()?.InsertAtTop(&visual)?;
+                Ok((visual, shape))
+            };
+            let (backdrop, backdrop_shape) = frosted()?;
+            let (island_backdrop, island_shape) = frosted()?;
 
             let (w, h) = (width.max(1), height.max(1));
             let surface = self.graphics.CreateDrawingSurface(
@@ -253,6 +262,8 @@ impl Gpu {
                 root,
                 backdrop,
                 backdrop_shape,
+                island_backdrop,
+                island_shape,
                 content,
                 surface: surface.cast()?,
                 size: (w, h),
@@ -381,15 +392,20 @@ impl Gpu {
 
     pub fn draw(&mut self, s: &mut Surface, f: &Frame, pixels: &HashMap<String, Option<IconPixels>>) -> Result<()> {
         s.root.SetOffset(Vector3 { X: f.offset.0, Y: f.offset.1, Z: 0.0 })?;
-        let show_backdrop = f.blur && f.bar.w() > 0.0;
-        s.backdrop.SetIsVisible(show_backdrop)?;
-        if show_backdrop {
-            let size = Vector2 { X: f.bar.w(), Y: f.bar.h() };
-            s.backdrop.SetOffset(Vector3 { X: f.bar.l, Y: f.bar.t, Z: 0.0 })?;
-            s.backdrop.SetSize(size)?;
-            s.backdrop_shape.SetSize(size)?;
-            s.backdrop_shape.SetCornerRadius(Vector2 { X: f.bar_radius, Y: f.bar_radius })?;
-        }
+        let frost = |visual: &SpriteVisual, shape: &CompositionRoundedRectangleGeometry, rect: Option<RectF>| -> Result<()> {
+            let rect = rect.filter(|r| f.blur && r.w() > 0.0);
+            visual.SetIsVisible(rect.is_some())?;
+            if let Some(r) = rect {
+                let size = Vector2 { X: r.w(), Y: r.h() };
+                visual.SetOffset(Vector3 { X: r.l, Y: r.t, Z: 0.0 })?;
+                visual.SetSize(size)?;
+                shape.SetSize(size)?;
+                shape.SetCornerRadius(Vector2 { X: f.bar_radius, Y: f.bar_radius })?;
+            }
+            Ok(())
+        };
+        frost(&s.backdrop, &s.backdrop_shape, Some(f.bar))?;
+        frost(&s.island_backdrop, &s.island_shape, f.island)?;
 
         let prepared = Prepared {
             bitmaps: f.icons.iter().map(|i| self.bitmap(i.source, pixels)).collect(),
@@ -405,7 +421,7 @@ impl Gpu {
             .chain(f.shapes.iter().map(|s| s.rect))
             .chain(f.labels.iter().map(|l| l.rect))
             .chain(f.texts.iter().map(|t| t.rect))
-            .chain(std::iter::once(f.bar).filter(|b| b.w() > 0.0))
+            .chain(std::iter::once(f.bar).chain(f.island).filter(|b| b.w() > 0.0))
             .reduce(|a, b| RectF { l: a.l.min(b.l), t: a.t.min(b.t), r: a.r.max(b.r), b: a.b.max(b.b) })
             .map(|r| r.inflate(2.0));
         let to_rect = |r: RectF| RECT {
@@ -458,10 +474,10 @@ impl Gpu {
             dc.PushAxisAlignedClip(&clip.d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
             dc.Clear(Some(&color(Color::rgba(0, 0, 0, 0))));
 
-            if f.bar.w() > 0.0 {
-                self.fill(dc, f.bar, f.bar_radius, f.bar_fill);
+            for bar in std::iter::once(f.bar).chain(f.island).filter(|b| b.w() > 0.0) {
+                self.fill(dc, bar, f.bar_radius, f.bar_fill);
                 self.brush.SetColor(&color(f.bar_border));
-                let edge = f.bar.inflate(-0.5);
+                let edge = bar.inflate(-0.5);
                 let rr = D2D1_ROUNDED_RECT { rect: edge.d2d(), radiusX: f.bar_radius - 0.5, radiusY: f.bar_radius - 0.5 };
                 dc.DrawRoundedRectangle(&rr, &self.brush, 1.0, None);
             }

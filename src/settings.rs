@@ -2,7 +2,7 @@
 //! reloads the file, so every change shows up live.
 
 use crate::clock;
-use crate::config::{self, Color, Config, DateStyle, IndicatorStyle, MonitorSel, Pinned, Position, Show, Theme};
+use crate::config::{self, Color, Config, DateStyle, IndicatorStyle, MonitorSel, Pinned, Placement, Position, Show, Theme};
 use crate::hotkeys;
 use crate::shell;
 use crate::softgui;
@@ -366,8 +366,27 @@ impl Settings {
         let taskbar_hidden = self.cfg.dock.hide_taskbar;
         let theme = Config { clock: Default::default(), tray: Default::default(), ..self.cfg.clone() }.palette(self.dark(), self.cfg.appearance.blur);
         let theme_colour = theme.clock;
-        let k = &mut self.cfg.clock;
 
+        section(ui, "Placement");
+        grid(ui, "placement", |ui| {
+            ui.label("Clock and status icons");
+            ui.horizontal(|ui| {
+                let p = &mut self.cfg.tray.placement;
+                for (v, label) in [(Placement::Dock, "In the dock"), (Placement::Corner, "Corner island"), (Placement::Hidden, "Hidden")] {
+                    c |= ui.selectable_value(p, v, label).changed();
+                }
+            });
+            ui.end_row();
+        });
+        let where_ = match (self.cfg.tray.placement, self.cfg.dock.position) {
+            (Placement::Dock, _) => "At the end of the dock, after a separator.",
+            (Placement::Corner, Position::Bottom | Position::Top) => "In a small bar of their own at the right-hand end of the dock's edge, under Windows' panels.",
+            (Placement::Corner, _) => "In a small bar of their own at the bottom of the dock's edge.",
+            (Placement::Hidden, _) => "Not shown. The settings below are kept for when you bring them back.",
+        };
+        ui.label(egui::RichText::new(where_).weak());
+
+        let k = &mut self.cfg.clock;
         section(ui, "Clock");
         grid(ui, "clock", |ui| {
             ui.label("Show");

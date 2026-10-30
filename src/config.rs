@@ -313,10 +313,23 @@ impl Default for Clock {
     }
 }
 
-/// The status icons (volume, network, battery) beside the clock.
+/// Where the clock and status icons go.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    /// At the end of the dock, after a separator.
+    #[default]
+    Dock,
+    /// In a small bar of their own at the end of the dock's screen edge.
+    Corner,
+    Hidden,
+}
+
+/// The status icons (volume, network, battery) beside the clock, and where both go.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Tray {
+    pub placement: Placement,
     pub show: Show,
     pub volume: bool,
     pub network: bool,
@@ -329,7 +342,7 @@ pub struct Tray {
 
 impl Default for Tray {
     fn default() -> Self {
-        Self { show: Show::Auto, volume: true, network: true, battery: true, icon_size: 16.0, color: None }
+        Self { placement: Placement::Dock, show: Show::Auto, volume: true, network: true, battery: true, icon_size: 16.0, color: None }
     }
 }
 
@@ -345,12 +358,12 @@ impl Show {
 
 impl Config {
     pub fn shows_clock(&self) -> bool {
-        self.clock.show.resolve(self.dock.hide_taskbar)
+        self.tray.placement != Placement::Hidden && self.clock.show.resolve(self.dock.hide_taskbar)
     }
 
     pub fn shows_status(&self) -> bool {
         let t = &self.tray;
-        t.show.resolve(self.dock.hide_taskbar) && (t.volume || t.network || t.battery)
+        t.placement != Placement::Hidden && t.show.resolve(self.dock.hide_taskbar) && (t.volume || t.network || t.battery)
     }
 }
 
@@ -708,6 +721,7 @@ size = 12
 # Status icons beside the clock. Click them for Quick Settings, scroll over them to change
 # the volume, middle-click to mute.
 [tray]
+placement = "dock"           # clock and status icons: dock (at its end) | corner (a bar of their own) | hidden
 show = "auto"                # auto (while the Windows taskbar is hidden) | always | never
 volume = true
 network = true
@@ -727,6 +741,19 @@ const PINNED_COMMENT: &str = r"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_decides_whether_clock_and_status_show() {
+        let cfg = |placement: &str, hide_taskbar: bool| {
+            parse(&format!("[dock]\nhide_taskbar = {hide_taskbar}\n[tray]\nplacement = \"{placement}\"\n")).unwrap()
+        };
+        assert_eq!(cfg("corner", true).tray.placement, Placement::Corner);
+        assert!(cfg("corner", true).shows_clock() && cfg("corner", true).shows_status());
+        assert!(cfg("dock", true).shows_clock());
+        // Auto: only while the Windows taskbar (with its own clock) is hidden.
+        assert!(!cfg("dock", false).shows_clock() && !cfg("dock", false).shows_status());
+        assert!(!cfg("hidden", true).shows_clock() && !cfg("hidden", true).shows_status());
+    }
 
     #[test]
     fn default_config_parses() {

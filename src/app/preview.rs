@@ -366,6 +366,7 @@ impl App {
             // A touch more opaque than the dock so titles stay readable over busy windows.
             bar_fill: Color { a: pal.background.a.max(0.8), ..pal.background },
             bar_border: pal.border,
+            island: None,
             blur: self.blur,
             placeholder: pal.placeholder,
             shapes,

@@ -5,7 +5,7 @@ mod preview;
 
 use crate::apps::{self, AppKey};
 use crate::clock;
-use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
+use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position};
 use crate::icons::{IconLoader, IconPixels};
 use crate::render::{Font, Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
 use crate::hotkeys;
@@ -281,6 +281,8 @@ struct Slot {
 struct Layout {
     slots: Vec<Slot>,
     bar: (f32, f32),
+    /// The corner island's extent along the dock, when the clock and status icons are there.
+    island: Option<(f32, f32)>,
 }
 
 struct Press {
@@ -1030,7 +1032,7 @@ impl App {
         items.extend(running);
         let status = self.cfg.shows_status() && !self.status_glyphs.is_empty();
         let clock = self.cfg.shows_clock();
-        if (status || clock) && !items.is_empty() {
+        if (status || clock) && !items.is_empty() && self.cfg.tray.placement == Placement::Dock {
             items.push(Item::new("sep:system".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
         }
         if status {
@@ -1099,13 +1101,20 @@ impl App {
         }
     }
 
+    /// In the corner island rather than the dock itself.
+    fn in_island(&self, it: &Item) -> bool {
+        self.cfg.tray.placement == Placement::Corner && matches!(it.kind, Kind::Clock | Kind::Status)
+    }
+
     /// Lays icons out at their current magnification, anchored so the point under the
     /// cursor stays put (the macOS behaviour) and centred when nothing is magnified.
+    /// Items in the corner island are left out here and placed at the end of the edge.
     fn compute_layout(&self) -> Layout {
         let m = &self.m;
         let center = self.axis.main() / 2.0;
-        let w0: Vec<f32> = self.items.iter().map(|it| it.appear * (self.base_size(it) + m.gap)).collect();
-        let w1: Vec<f32> = self.items.iter().map(|it| it.appear * (self.base_size(it) * it.mag + m.gap)).collect();
+        let width = |it: &Item, mag: f32| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) * mag + m.gap) };
+        let w0: Vec<f32> = self.items.iter().map(|it| width(it, 1.0)).collect();
+        let w1: Vec<f32> = self.items.iter().map(|it| width(it, it.mag)).collect();
         let (l0, l1): (f32, f32) = (w0.iter().sum(), w1.iter().sum());
         let s0 = center - l0 / 2.0;
         let c = self.anchor;
@@ -1127,7 +1136,7 @@ impl App {
             start
         };
         let mut u = start;
-        let slots = self
+        let mut slots: Vec<Slot> = self
             .items
             .iter()
             .zip(&w1)
@@ -1144,7 +1153,22 @@ impl App {
         } else {
             (start - edge, start + l1 + edge)
         };
-        Layout { slots, bar }
+
+        // The island sits as far from the end of the edge as the dock sits from the edge.
+        let island_len: f32 = self.items.iter().filter(|it| self.in_island(it)).map(|it| it.appear * (self.base_size(it) + m.gap)).sum();
+        let island = (island_len > 0.0).then(|| {
+            let end = self.axis.main() - m.margin;
+            let mut u = end - edge - island_len;
+            for (it, slot) in self.items.iter().zip(&mut slots) {
+                if self.in_island(it) {
+                    let w = it.appear * (self.base_size(it) + m.gap);
+                    *slot = Slot { u0: u, w, center: u + w / 2.0, size: self.base_size(it) * it.appear };
+                    u += w;
+                }
+            }
+            (end - island_len - 2.0 * edge, end)
+        });
+        Layout { slots, bar, island }
     }
 
     fn slide_distance(&self) -> f32 {
@@ -1178,8 +1202,8 @@ impl App {
         if self.drag.as_ref().is_some_and(|d| !d.removing) {
             return true;
         }
-        let (b0, b1) = self.layout.bar;
-        if u >= b0 && u <= b1 && v <= self.m.margin + self.m.thick {
+        let on_bar = |(b0, b1): (f32, f32)| u >= b0 && u <= b1 && v <= self.m.margin + self.m.thick;
+        if on_bar(self.layout.bar) || self.layout.island.is_some_and(on_bar) {
             return true;
         }
         (0..self.items.len()).any(|i| {
@@ -1252,12 +1276,13 @@ impl App {
             _ => (0.0, false),
         };
         // Distances are measured on the unmagnified layout so the effect doesn't feed back on itself.
-        let total: f32 = self.items.iter().map(|it| it.appear * (self.base_size(it) + m.gap)).sum();
+        let width = |it: &Item| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) + m.gap) };
+        let total: f32 = self.items.iter().map(width).sum();
         let mut u = self.axis.main() / 2.0 - total / 2.0;
         self.items
             .iter()
             .map(|it| {
-                let w = it.appear * (self.base_size(it) + m.gap);
+                let w = width(it);
                 let center = u + w / 2.0;
                 u += w;
                 if !ok || !it.is_app() {
@@ -1278,6 +1303,10 @@ impl App {
         let (b0, b1) = self.layout.bar;
         let bar = ax.rect(b0, b1, m.margin, m.margin + m.thick);
         let mut region = vec![ax.rect(b0, b1, 0.0, m.margin + m.thick)];
+        let island = self.layout.island.map(|(i0, i1)| {
+            region.push(ax.rect(i0, i1, 0.0, m.margin + m.thick));
+            ax.rect(i0, i1, m.margin, m.margin + m.thick)
+        });
 
         // Label: the hovered app's name, or a notice (e.g. a config error).
         let hovered = self
@@ -1389,6 +1418,7 @@ impl App {
             bar_radius: m.radius,
             bar_fill: pal.background,
             bar_border: pal.border,
+            island,
             blur: self.blur,
             placeholder: pal.placeholder,
             shapes,
@@ -1534,8 +1564,8 @@ impl App {
             vec![RECT { left: 0, top: 0, right: ax.w as i32, bottom: ax.h as i32 }]
         } else if self.cfg.dock.autohide && self.hide_target >= 1.0 && self.hide > 0.95 {
             // Fully hidden: a thin strip along the screen edge to reveal it.
-            let (b0, b1) = self.layout.bar;
-            vec![to_rect(ax.rect(b0, b1, 0.0, (2.0 * self.m.s).max(2.0)))]
+            let strip = (2.0 * self.m.s).max(2.0);
+            std::iter::once(self.layout.bar).chain(self.layout.island).map(|(b0, b1)| to_rect(ax.rect(b0, b1, 0.0, strip))).collect()
         } else {
             rects.into_iter().map(|r| to_rect(r.translate(offset.0, offset.1).inflate(1.0))).collect()
         };

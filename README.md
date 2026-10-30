@@ -7,7 +7,8 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - macOS-style magnification (optional), frosted-glass background, light/dark theme that follows Windows
 - Bottom, top, left or right edge, any monitor, optional auto-hide
 - Can hide the Windows taskbar while it runs, and puts it back when it quits
-- A clock and network, volume and battery icons, shown automatically when the taskbar is hidden
+- A clock and network, volume and battery icons, shown automatically when the taskbar is hidden:
+  at the end of the dock, or in a small bar of their own in the screen corner
 - Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
 - Keyboard shortcuts for pinned apps and for showing the dock
 - Hot-reloaded TOML config
@@ -91,6 +92,7 @@ size = 12
 # color = "#f5f5f7"
 
 [tray]                   # status icons beside the clock
+placement = "dock"       # clock and status icons: dock | corner | hidden
 show = "auto"            # auto | always | never
 network = true
 volume = true
