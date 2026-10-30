@@ -9,9 +9,10 @@ use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersio
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN, VK_N};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_SHOWNORMAL};
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
 pub const APPS_FOLDER: &str = r"shell:AppsFolder\";
@@ -281,15 +282,30 @@ pub fn set_menu_theme(mode: crate::config::Theme) {
     }
 }
 
+/// Whether `hwnd` is Quick Settings' window.
+pub fn is_quick_settings(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..n]) == "ControlCenterWindow"
+}
+
 /// Opens Quick Settings (Wi-Fi, volume, battery) by pressing Win+A: unlike the notification
 /// centre, it has no URI that works on current Windows 11.
 pub fn open_quick_settings() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN};
+    press_win(VK_A);
+}
+
+/// Closes the notification centre: Win+N toggles it, while its URI only ever opens it.
+pub fn close_notification_center() {
+    press_win(VK_N);
+}
+
+fn press_win(vk: VIRTUAL_KEY) {
     let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() } },
     };
-    let keys = [key(VK_LWIN, false), key(VK_A, false), key(VK_A, true), key(VK_LWIN, true)];
+    let keys = [key(VK_LWIN, false), key(vk, false), key(vk, true), key(VK_LWIN, true)];
     unsafe {
         SendInput(&keys, size_of::<INPUT>() as i32);
     }

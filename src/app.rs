@@ -47,6 +47,8 @@ const WM_APP_TASKBAR_SHOWN: u32 = WM_APP + 7;
 const WM_APP_STATUS: u32 = WM_APP + 8;
 /// An app failed to start; wparam is a `Box<String>` holding the item's id.
 const WM_APP_LAUNCH_FAILED: u32 = WM_APP + 9;
+/// Quick Settings opened (wparam is its window) or closed (wparam is 0).
+const WM_APP_QUICK_SETTINGS: u32 = WM_APP + 10;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
@@ -140,6 +142,8 @@ struct Item {
     shift: f32,
     bounce: Option<f32>,
     bounce_end: f32,
+    /// The clock's and status icons' hover highlight, 0 to 1.
+    glow: f32,
 }
 
 impl Item {
@@ -158,6 +162,7 @@ impl Item {
             shift: 0.0,
             bounce: None,
             bounce_end: 0.0,
+            glow: 0.0,
         }
     }
 
@@ -395,6 +400,8 @@ pub struct App {
     hide_target: f32,
     fullscreen: bool,
     dirty: bool,
+    /// Quick Settings is open.
+    quick_settings_open: bool,
     animating: bool,
     last: Instant,
     region: Vec<RECT>,
@@ -476,6 +483,7 @@ impl App {
             hide_target: 0.0,
             fullscreen: false,
             dirty: true,
+            quick_settings_open: false,
             animating: false,
             last: Instant::now(),
             region: Vec::new(),
@@ -1258,8 +1266,11 @@ impl App {
                 self.anchor = u;
             }
         let targets = self.magnification_targets(hovering);
-        for (it, t) in self.items.iter_mut().zip(targets) {
+        let lit = if hovering && self.drag.is_none() && !self.menu_open { self.hovered_index() } else { None };
+        for (i, (it, t)) in self.items.iter_mut().zip(targets).enumerate() {
             moving |= approach(&mut it.mag, t, k(16.0), 0.001);
+            let glow = if lit == Some(i) && matches!(it.kind, Kind::Clock | Kind::Status) { 1.0 } else { 0.0 };
+            moving |= approach(&mut it.glow, glow, k(16.0), 0.01);
         }
         if let Some((_, until)) = &self.notice
             && Instant::now() >= *until {
@@ -1314,7 +1325,9 @@ impl App {
         // Label: the hovered app's name, or a notice (e.g. a config error).
         let hovered = self
             .hovered_index()
-            .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id));
+            .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id))
+            // The status icons' label would show beneath the Quick Settings they opened.
+            .filter(|&i| !(self.quick_settings_open && self.items[i].kind == Kind::Status));
         let label_req = match (&self.notice, hovered) {
             (Some((text, _)), _) => Some((text.clone(), (b0 + b1) / 2.0, m.margin + m.thick)),
             _ if self.dragging.is_some() => self.drop_label(),
@@ -1340,7 +1353,6 @@ impl App {
         let mut shapes = Vec::new();
         let mut icons = Vec::new();
         let mut texts = Vec::new();
-        let hovered_any = if self.drag.is_none() && !self.menu_open { self.hovered_index() } else { None };
         let drag_id = self.drag.as_ref().map(|d| d.id.as_str());
         for (i, it) in self.items.iter().enumerate() {
             let Some(slot) = self.layout.slots.get(i) else { continue };
@@ -1356,10 +1368,12 @@ impl App {
             }
             if matches!(it.kind, Kind::Clock | Kind::Status) {
                 let Some((u0, u1, v0, v1)) = self.icon_uv(i) else { continue };
-                // These don't magnify, so a soft highlight shows what's under the cursor.
-                if hovered_any == Some(i) {
-                    let inset = 4.0 * m.s;
-                    shapes.push(Shape { rect: ax.rect(u0, u1, v0 + inset, v1 - inset), radius: 6.0 * m.s, color: pal.separator.alpha(0.6) });
+                // These don't magnify, so a soft highlight fades in under the cursor. Its corners
+                // follow the bar's, an even inset in from them.
+                if it.glow > 0.0 {
+                    let inset = 6.0 * m.s;
+                    let radius = (m.radius - inset).max(4.0 * m.s);
+                    shapes.push(Shape { rect: ax.rect(u0, u1, v0 + inset, v1 - inset), radius, color: pal.separator.alpha(0.6 * it.glow) });
                 }
                 if it.kind == Kind::Clock {
                     texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: self.clock_text.clone(), color: pal.clock.alpha(it.appear), font: Font::Clock });
@@ -1670,8 +1684,14 @@ impl App {
 
     fn click(&mut self, i: usize) {
         match self.items[i].kind {
+            // Clicking the dock doesn't take the focus, so an open notification centre is still
+            // in front, and a second click closes it.
             Kind::Clock => {
-                shell::launch("ms-actioncenter:", None, None);
+                if apps::is_notification_center(apps::foreground()) {
+                    shell::close_notification_center();
+                } else {
+                    shell::launch("ms-actioncenter:", None, None);
+                }
                 return;
             }
             Kind::Status => {
@@ -1731,6 +1751,38 @@ impl App {
             && let Some(t) = it.bounce
         {
             it.bounce_end = ((t / BOUNCE_PERIOD).ceil() * BOUNCE_PERIOD).max(BOUNCE_PERIOD);
+        }
+    }
+
+    /// Windows opens Quick Settings at the right of the screen; with the status icons in the
+    /// dock, it belongs above them. The panel is recreated on each open, so nothing is undone.
+    /// Its window spans the screen's height with the content at the bottom, so on a side dock
+    /// only x moves, and a top dock leaves it alone.
+    fn place_quick_settings(&mut self, hwnd: HWND) {
+        if self.cfg.tray.placement != Placement::Dock || self.axis.pos == Position::Top {
+            return;
+        }
+        let anchor = self.items.iter().position(|it| it.kind == Kind::Status).or_else(|| self.items.iter().position(|it| it.kind == Kind::Clock));
+        let Some((u0, u1, _, v1)) = anchor.and_then(|i| self.icon_uv(i)) else { return };
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
+            return;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        // The window has a margin of its own around the panel, so it can touch the dock.
+        let (ax, ay) = self.axis.xy((u0 + u1) / 2.0, v1);
+        let (ax, ay) = (self.origin.0 + ax.round() as i32, self.origin.1 + ay.round() as i32);
+        let (x, y) = match self.axis.pos {
+            Position::Bottom => (ax - w / 2, ay - h),
+            Position::Left => (ax, r.top),
+            _ => (ax - w, r.top),
+        };
+        let wk = self.work;
+        let x = x.clamp(wk.left, (wk.right - w).max(wk.left));
+        if (x, y) != (r.left, r.top) {
+            unsafe {
+                let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
     }
 
@@ -2029,6 +2081,13 @@ impl App {
             WM_TIMECHANGE => self.update_clock(),
             // Changes arrive in bursts (e.g. a volume slider dragging); read once they settle.
             WM_APP_STATUS => self.set_timer(TIMER_STATUS, 100),
+            WM_APP_QUICK_SETTINGS => {
+                self.quick_settings_open = wp.0 != 0;
+                if self.quick_settings_open {
+                    self.place_quick_settings(HWND(wp.0 as _));
+                }
+                self.dirty = true;
+            }
             WM_APP_LAUNCH_FAILED => {
                 let id = unsafe { Box::from_raw(wp.0 as *mut String) };
                 self.launch_failed(&id);
@@ -2146,6 +2205,8 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     let id = hwnd.0 as isize;
     let tracked = TRACKED.with(|t| t.borrow().contains(&id));
     match event {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED if shell::is_quick_settings(hwnd) => post(WM_APP_QUICK_SETTINGS, id as usize),
+        EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED if shell::is_quick_settings(hwnd) => post(WM_APP_QUICK_SETTINGS, 0),
         EVENT_SYSTEM_FOREGROUND => post(WM_APP_FOREGROUND, id as usize),
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED if tracked => post(WM_APP_REFRESH, 0),
         EVENT_OBJECT_SHOW if taskbar::is_taskbar(hwnd) => post(WM_APP_TASKBAR_SHOWN, 0),

@@ -7,6 +7,7 @@ use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONULL, MonitorFrom
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use std::collections::HashMap;
+use std::path::Path;
 use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -141,6 +142,19 @@ pub fn app_windows(own_pid: u32, all_desktops: bool) -> Vec<HWND> {
         .flatten();
     all.retain(|&h| is_app_window(h, own_pid, desktops.as_ref()));
     all
+}
+
+/// Whether `hwnd` is the notification centre. Its title is translated, so it's recognised as a
+/// core window of ShellExperienceHost instead.
+pub fn is_notification_center(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    if String::from_utf16_lossy(&buf[..n]) != "Windows.UI.Core.CoreWindow" {
+        return false;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    process_path(pid).is_some_and(|p| Path::new(&p).file_name().is_some_and(|f| f.eq_ignore_ascii_case("ShellExperienceHost.exe")))
 }
 
 fn process_path(pid: u32) -> Option<String> {
