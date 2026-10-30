@@ -2,7 +2,7 @@
 //! reloads the file, so every change shows up live.
 
 use crate::clock;
-use crate::config::{self, Color, Config, DateStyle, IndicatorStyle, MonitorSel, Pinned, Placement, Position, Show, Theme};
+use crate::config::{self, Color, Config, DateStyle, IndicatorStyle, MonitorSel, Pinned, Placement, Position, Show, Theme, TrayApps};
 use crate::hotkeys;
 use crate::shell;
 use crate::softgui;
@@ -223,6 +223,20 @@ impl Settings {
             c |= toggle(ui, &mut d.reserve_space, "Reserve space", help);
         });
         c |= toggle(ui, &mut d.hide_taskbar, "Hide the Windows taskbar", "Its clock and tray icons are hidden too; it comes back when Windock quits");
+        ui.indent("taskbar buttons", |ui| {
+            grid(ui, "taskbar buttons", |ui| {
+                for (label, value) in [("Start button", &mut d.start_button), ("Show desktop", &mut d.show_desktop)] {
+                    ui.label(label);
+                    ui.horizontal(|ui| {
+                        for (s, text) in [(Show::Auto, "With the taskbar hidden"), (Show::Always, "Always"), (Show::Never, "Never")] {
+                            c |= ui.selectable_value(value, s, text).changed();
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        ui.add_space(4.0);
         c |= toggle(ui, &mut d.always_on_top, "Always on top", "");
         c |= toggle(ui, &mut d.hide_on_fullscreen, "Hide for full screen", "Games and videos");
         c |= toggle(ui, &mut d.show_running, "Show running apps", "Includes apps that aren't pinned");
@@ -488,6 +502,7 @@ impl Settings {
             });
             ui.end_row();
             c |= slider(ui, "Icon size", &mut t.icon_size, 10.0..=32.0, " px");
+            c |= slider(ui, "Spacing", &mut t.spacing, 0.0..=32.0, " px");
             let mut custom_colour = t.color.is_some();
             if ui.checkbox(&mut custom_colour, "Icon colour").changed() {
                 t.color = custom_colour.then_some(theme.status);
@@ -504,6 +519,17 @@ impl Settings {
         c |= toggle(ui, &mut t.network, "Network", "");
         c |= toggle(ui, &mut t.volume, "Volume", "Scroll over the icons to change it; middle-click to mute");
         c |= toggle(ui, &mut t.battery, "Battery", "Only on devices with a battery");
+        ui.add_space(4.0);
+        grid(ui, "tray apps", |ui| {
+            ui.label("Other apps' icons");
+            ui.horizontal(|ui| {
+                for (v, label) in [(TrayApps::Promoted, "Like the taskbar"), (TrayApps::All, "All"), (TrayApps::None, "None")] {
+                    c |= ui.selectable_value(&mut t.apps, v, label).changed();
+                }
+            });
+            ui.end_row();
+        });
+        ui.label(egui::RichText::new("Like the taskbar: the icons Windows shows there, the rest behind an arrow. Choose which in Windows Settings › Personalization › Taskbar.").weak());
         ui.add_space(6.0);
         let note = match t.show {
             Show::Auto if !taskbar_hidden => "Hidden for now: they appear while the Windows taskbar is hidden.",

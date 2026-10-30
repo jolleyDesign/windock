@@ -9,6 +9,9 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - Can hide the Windows taskbar while it runs, and puts it back when it quits
 - A clock and network, volume and battery icons, shown automatically when the taskbar is hidden:
   at the end of the dock, or in a small bar of their own in the screen corner
+- Other apps' tray icons (OneDrive, Slack, VPN clients...) beside them, the ones Windows keeps off
+  the taskbar behind an arrow
+- A Start button and a Show desktop button, also shown automatically when the taskbar is hidden
 - Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
 - Keyboard shortcuts for pinned apps and for showing the dock
 - Hot-reloaded TOML config
@@ -31,6 +34,10 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Click the clock | Notifications and calendar (right-click: Adjust date and time) |
 | Click the network/volume icons | Quick Settings, opened above them when they're in a bottom or side dock (right-click: sound, mixer, network and power settings) |
 | Scroll over them / middle-click | Change the volume / mute |
+| Click / right-click another app's tray icon | What it does on the taskbar: usually open the app / its menu |
+| Click the arrow beside them | A grid of the tray icons Windows keeps off the taskbar; click or right-click them as usual |
+| Click the Start button | Open (or close) the Start menu; right-click for the Win+X menu |
+| Click Show desktop | Minimize every window; click again to bring them back |
 | Ctrl+Alt+1–9 (0 for the 10th) | Open or switch to that pinned app, like clicking it |
 | Win+Shift+D | Show or hide the dock (with auto-hide: slide it in) |
 
@@ -55,6 +62,8 @@ hide_on_fullscreen = true
 click_minimizes = true
 autostart = false        # start at sign-in
 gpu = false              # GPU rendering: ~40 MB more RAM; software is plenty for a dock
+start_button = "auto"    # auto (while the taskbar is hidden) | always | never
+show_desktop = "auto"    # auto | always | never
 
 [appearance]
 theme = "auto"           # auto | dark | light
@@ -97,7 +106,9 @@ show = "auto"            # auto | always | never
 network = true
 volume = true
 battery = true           # only on devices with a battery
+apps = "promoted"        # other apps' icons: promoted (as the taskbar shows them) | all | none
 icon_size = 16
+spacing = 12             # between these icons and the clock; [appearance] spacing is for apps
 
 [[pinned]]
 path = 'C:\Windows\explorer.exe'          # .exe, .lnk, folder, or
@@ -128,8 +139,10 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | --- | --- |
 | `src/app.rs` | The dock window: layout, magnification, input, drag & drop, auto-hide, animation loop |
 | `src/app/preview.rs` | The hover popup with live DWM window thumbnails |
+| `src/app/overflow.rs` | The grid of hidden tray icons that opens from the arrow |
 | `src/app/droptarget.rs` | Files dragged onto the dock: open with an app, or pin |
 | `src/clock.rs` | The clock's text, formatted by Windows |
+| `src/tray.rs` | Other apps' tray icons: a stand-in `Shell_TrayWnd` that keeps a copy and passes everything on to Explorer |
 | `src/status.rs` | Volume, network and battery, watched through Core Audio, IP Helper, WLAN and power notifications |
 | `src/hotkeys.rs` | Parsing shortcut strings like `win+shift+d` |
 | `src/settings.rs` | The settings window (`windock.exe --settings`, egui) |

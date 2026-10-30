@@ -7,7 +7,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, HICON, ICONINFO, PostMessageW};
 use windows::core::HSTRING;
 
 /// Premultiplied BGRA pixels, top-down.
@@ -86,6 +86,18 @@ fn load(source: &str, size: u32) -> Option<IconPixels> {
 }
 
 unsafe fn bitmap_pixels(hbm: HBITMAP) -> Option<IconPixels> {
+    let mut px = unsafe { raw_pixels(hbm) }?;
+    if px.data.chunks_exact(4).all(|p| p[3] == 0) {
+        // No alpha channel at all: the image is opaque.
+        px.data.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+    } else {
+        premultiply(&mut px);
+    }
+    Some(px)
+}
+
+/// A bitmap's pixels as 32-bit BGRA, alpha untouched.
+unsafe fn raw_pixels(hbm: HBITMAP) -> Option<IconPixels> {
     unsafe {
         let mut bm = BITMAP::default();
         if GetObjectW(hbm.into(), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
@@ -111,22 +123,46 @@ unsafe fn bitmap_pixels(hbm: HBITMAP) -> Option<IconPixels> {
         let dc = GetDC(None);
         let lines = GetDIBits(dc, hbm, 0, h, Some(data.as_mut_ptr() as _), &mut info, DIB_RGB_COLORS);
         ReleaseDC(None, dc);
-        if lines == 0 {
-            return None;
-        }
-        if data.chunks_exact(4).all(|p| p[3] == 0) {
-            // No alpha channel at all: the image is opaque.
-            data.chunks_exact_mut(4).for_each(|p| p[3] = 255);
-        } else if data.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
-            // Straight alpha; Direct2D wants premultiplied.
-            for p in data.chunks_exact_mut(4) {
-                let a = p[3] as u32;
-                for c in &mut p[..3] {
-                    *c = ((*c as u32 * a + 127) / 255) as u8;
-                }
+        (lines != 0).then_some(IconPixels { width: w, height: h, data })
+    }
+}
+
+/// Direct2D wants premultiplied alpha; leaves pixels that already are alone.
+fn premultiply(px: &mut IconPixels) {
+    if px.data.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
+        for p in px.data.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
             }
         }
-        Some(IconPixels { width: w, height: h, data })
+    }
+}
+
+/// An icon handle's picture at its own size. Icons without alpha take transparency from
+/// their mask.
+pub fn icon_pixels(icon: HICON) -> Option<IconPixels> {
+    unsafe {
+        let mut info = ICONINFO::default();
+        GetIconInfo(icon, &mut info).ok()?;
+        let color = if info.hbmColor.is_invalid() { None } else { raw_pixels(info.hbmColor) };
+        let mask = raw_pixels(info.hbmMask);
+        let _ = DeleteObject(info.hbmColor.into());
+        let _ = DeleteObject(info.hbmMask.into());
+        let mut px = color?;
+        if px.data.chunks_exact(4).all(|p| p[3] == 0) {
+            let mask = mask.filter(|m| m.width == px.width && m.height >= px.height)?;
+            for (p, m) in px.data.chunks_exact_mut(4).zip(mask.data.chunks_exact(4)) {
+                if m[0] != 0 {
+                    p.copy_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    p[3] = 255;
+                }
+            }
+        } else {
+            premultiply(&mut px);
+        }
+        Some(px)
     }
 }
 

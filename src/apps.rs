@@ -74,7 +74,7 @@ pub fn title(hwnd: HWND) -> String {
     from_wide(&buf[..n])
 }
 
-fn pid_of(hwnd: HWND) -> u32 {
+pub fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
@@ -157,7 +157,7 @@ pub fn is_notification_center(hwnd: HWND) -> bool {
     process_path(pid).is_some_and(|p| Path::new(&p).file_name().is_some_and(|f| f.eq_ignore_ascii_case("ShellExperienceHost.exe")))
 }
 
-fn process_path(pid: u32) -> Option<String> {
+pub fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

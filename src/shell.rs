@@ -9,7 +9,7 @@ use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersio
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN, VK_N};
+use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN, VK_N, VK_X};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_SHOWNORMAL};
@@ -300,12 +300,40 @@ pub fn close_notification_center() {
     press_win(VK_N);
 }
 
+/// Opens or closes the Start menu, as the Windows key does.
+pub fn toggle_start() {
+    press(&[VK_LWIN]);
+}
+
+/// The Win+X menu: Device Manager, Terminal, Shut down and so on.
+pub fn open_power_menu() {
+    press_win(VK_X);
+}
+
+/// Minimizes every window, or brings them back, like Win+D. Windows keeps the list of what
+/// to restore, so this agrees with the taskbar's own button and the keyboard shortcut.
+pub fn toggle_desktop() {
+    unsafe {
+        match CoCreateInstance::<_, IShellDispatch4>(&Shell, None, CLSCTX_INPROC_SERVER) {
+            Ok(shell) => {
+                let _ = shell.ToggleDesktop();
+            }
+            Err(e) => crate::log!("couldn't toggle the desktop: {e}"),
+        }
+    }
+}
+
 fn press_win(vk: VIRTUAL_KEY) {
+    press(&[VK_LWIN, vk]);
+}
+
+/// Presses the keys in order, then releases them in reverse.
+fn press(vks: &[VIRTUAL_KEY]) {
     let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() } },
     };
-    let keys = [key(VK_LWIN, false), key(vk, false), key(vk, true), key(VK_LWIN, true)];
+    let keys: Vec<INPUT> = vks.iter().map(|&vk| key(vk, false)).chain(vks.iter().rev().map(|&vk| key(vk, true))).collect();
     unsafe {
         SendInput(&keys, size_of::<INPUT>() as i32);
     }

@@ -118,6 +118,10 @@ pub struct Dock {
     pub click_minimizes: bool,
     pub autostart: bool,
     pub gpu: bool,
+    /// A Start button at the beginning of the dock.
+    pub start_button: Show,
+    /// A button at the end of the dock that minimizes every window, and brings them back.
+    pub show_desktop: Show,
 }
 
 impl Default for Dock {
@@ -138,6 +142,8 @@ impl Default for Dock {
             click_minimizes: true,
             autostart: false,
             gpu: false,
+            start_button: Show::Auto,
+            show_desktop: Show::Auto,
         }
     }
 }
@@ -325,6 +331,17 @@ pub enum Placement {
     Hidden,
 }
 
+/// Which other apps' tray icons (OneDrive, Slack...) show beside the status icons.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TrayApps {
+    /// The ones Windows shows on the taskbar; the rest behind an arrow.
+    #[default]
+    Promoted,
+    All,
+    None,
+}
+
 /// The status icons (volume, network, battery) beside the clock, and where both go.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -335,14 +352,17 @@ pub struct Tray {
     pub network: bool,
     /// Only on devices that have a battery.
     pub battery: bool,
+    pub apps: TrayApps,
     pub icon_size: f32,
+    /// Between the clock and the icons beside it; the dock's own spacing is for apps.
+    pub spacing: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<Color>,
 }
 
 impl Default for Tray {
     fn default() -> Self {
-        Self { placement: Placement::Dock, show: Show::Auto, volume: true, network: true, battery: true, icon_size: 16.0, color: None }
+        Self { placement: Placement::Dock, show: Show::Auto, volume: true, network: true, battery: true, apps: TrayApps::Promoted, icon_size: 16.0, spacing: 12.0, color: None }
     }
 }
 
@@ -364,6 +384,20 @@ impl Config {
     pub fn shows_status(&self) -> bool {
         let t = &self.tray;
         t.placement != Placement::Hidden && t.show.resolve(self.dock.hide_taskbar) && (t.volume || t.network || t.battery)
+    }
+
+    pub fn shows_tray_apps(&self) -> bool {
+        let t = &self.tray;
+        t.placement != Placement::Hidden && t.show.resolve(self.dock.hide_taskbar) && t.apps != TrayApps::None
+    }
+
+    pub fn shows_start(&self) -> bool {
+        self.dock.start_button.resolve(self.dock.hide_taskbar)
+    }
+
+    /// Unlike the clock, it stays in the dock when the clock and status icons are hidden.
+    pub fn shows_desktop_button(&self) -> bool {
+        self.dock.show_desktop.resolve(self.dock.hide_taskbar)
     }
 }
 
@@ -405,6 +439,8 @@ pub struct Palette {
     pub placeholder: Color,
     pub clock: Color,
     pub status: Color,
+    /// The Windows logo on the Start button.
+    pub start: Color,
 }
 
 impl Config {
@@ -420,6 +456,7 @@ impl Config {
         a.label_size = a.label_size.clamp(6.0, 48.0);
         self.clock.size = self.clock.size.clamp(6.0, 48.0);
         self.tray.icon_size = self.tray.icon_size.clamp(8.0, 48.0);
+        self.tray.spacing = self.tray.spacing.clamp(0.0, 48.0);
         let m = &mut self.magnification;
         m.scale = m.scale.clamp(1.0, 4.0);
         m.range = m.range.clamp(1.0, 10.0);
@@ -443,6 +480,7 @@ impl Config {
                 placeholder: Color::rgba(0x5a, 0x5a, 0x60, 0xff),
                 clock: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
                 status: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
+                start: Color::rgba(0x4c, 0xa8, 0xf5, 0xff),
             }
         } else {
             Palette {
@@ -457,6 +495,7 @@ impl Config {
                 placeholder: Color::rgba(0xb8, 0xb8, 0xc0, 0xff),
                 clock: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
                 status: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
+                start: Color::rgba(0x00, 0x78, 0xd4, 0xff),
             }
         };
         Palette {
@@ -471,6 +510,7 @@ impl Config {
             placeholder: def.placeholder,
             clock: self.clock.color.unwrap_or(def.clock),
             status: self.tray.color.unwrap_or(def.clock),
+            start: def.start,
         }
     }
 }
@@ -672,6 +712,8 @@ hide_on_fullscreen = true    # get out of the way of games and videos
 click_minimizes = true       # clicking the focused app minimizes it
 autostart = false            # start Windock when you sign in
 gpu = false                  # render on the GPU (uses ~40 MB more memory; software is plenty for a dock)
+start_button = "auto"        # Start button first in the dock: auto (while the taskbar is hidden) | always | never
+show_desktop = "auto"        # Show desktop button last in the dock: auto | always | never
 
 [appearance]
 theme = "auto"               # auto | dark | light
@@ -726,7 +768,9 @@ show = "auto"                # auto (while the Windows taskbar is hidden) | alwa
 volume = true
 network = true
 battery = true               # only on devices with a battery
+apps = "promoted"            # other apps' icons: promoted (those Windows shows on the taskbar; the rest behind an arrow) | all | none
 icon_size = 16
+spacing = 12                 # between these icons and the clock (appearance.spacing is for apps)
 # color = "#f5f5f7"
 "##;
 
@@ -753,6 +797,17 @@ mod tests {
         // Auto: only while the Windows taskbar (with its own clock) is hidden.
         assert!(!cfg("dock", false).shows_clock() && !cfg("dock", false).shows_status());
         assert!(!cfg("hidden", true).shows_clock() && !cfg("hidden", true).shows_status());
+    }
+
+    #[test]
+    fn start_and_show_desktop_follow_the_taskbar_unless_set() {
+        let cfg = |extra: &str, hide_taskbar: bool| parse(&format!("[dock]\nhide_taskbar = {hide_taskbar}\n{extra}")).unwrap();
+        assert!(cfg("", true).shows_start() && cfg("", true).shows_desktop_button());
+        assert!(!cfg("", false).shows_start() && !cfg("", false).shows_desktop_button());
+        assert!(cfg("start_button = \"always\"\n", false).shows_start());
+        assert!(!cfg("show_desktop = \"never\"\n", true).shows_desktop_button());
+        // Hiding the clock and status icons doesn't hide Show desktop.
+        assert!(parse("[dock]\nhide_taskbar = true\n[tray]\nplacement = \"hidden\"\n").unwrap().shows_desktop_button());
     }
 
     #[test]

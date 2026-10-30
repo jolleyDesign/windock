@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows::Win32::UI::Shell::{ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetClassNameW, IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
+use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetClassNameW, IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
 use windows::core::w;
 
 pub enum Pin {
@@ -154,20 +155,32 @@ fn hidden_marker() -> PathBuf {
     crate::util::data_dir().join("taskbar-hidden")
 }
 
-/// The main taskbar and the one on each other monitor.
+/// The main taskbar and the one on each other monitor. Skips the tray window Windock opens
+/// to collect other apps' tray icons, which has the main taskbar's class.
 fn taskbar_windows() -> Vec<HWND> {
     let mut found = Vec::new();
-    unsafe {
-        if let Ok(h) = FindWindowW(w!("Shell_TrayWnd"), None) {
-            found.push(h);
-        }
+    let own = unsafe { GetCurrentProcessId() };
+    for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
         let mut after = None;
-        while let Ok(h) = FindWindowExW(None, after, w!("Shell_SecondaryTrayWnd"), None) {
-            found.push(h);
+        while let Ok(h) = unsafe { FindWindowExW(None, after, class, None) } {
+            if crate::apps::pid_of(h) != own {
+                found.push(h);
+            }
             after = Some(h);
         }
     }
     found
+}
+
+/// Explorer's main taskbar window.
+pub fn explorer_tray() -> Option<HWND> {
+    taskbar_windows().into_iter().find(|&h| is_main_taskbar(h))
+}
+
+fn is_main_taskbar(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..n]) == "Shell_TrayWnd"
 }
 
 pub fn is_taskbar(hwnd: HWND) -> bool {

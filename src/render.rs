@@ -364,6 +364,10 @@ impl Gpu {
         self.bitmaps.clear();
     }
 
+    pub fn forget_bitmap(&mut self, source: &str) {
+        self.bitmaps.remove(source);
+    }
+
     fn bitmap(&mut self, source: &str, pixels: &HashMap<String, Option<IconPixels>>) -> Option<ID2D1Bitmap1> {
         if let Some(b) = self.bitmaps.get(source) {
             return Some(b.clone());

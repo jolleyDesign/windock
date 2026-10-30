@@ -1,17 +1,19 @@
 //! The dock window: layout, magnification, input, window tracking and animation.
 
 mod droptarget;
+mod overflow;
 mod preview;
 
 use crate::apps::{self, AppKey};
 use crate::clock;
-use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position};
+use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position, TrayApps};
 use crate::icons::{IconLoader, IconPixels};
 use crate::render::{Font, Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
 use crate::hotkeys;
 use crate::shell;
 use crate::status;
 use crate::taskbar;
+use crate::tray;
 use crate::util::{from_wide, wide};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +51,8 @@ const WM_APP_STATUS: u32 = WM_APP + 8;
 const WM_APP_LAUNCH_FAILED: u32 = WM_APP + 9;
 /// Quick Settings opened (wparam is its window) or closed (wparam is 0).
 const WM_APP_QUICK_SETTINGS: u32 = WM_APP + 10;
+/// Another app's tray icon was added, changed or removed.
+const WM_APP_TRAY: u32 = WM_APP + 11;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
@@ -57,6 +61,7 @@ const TIMER_NOTICE: usize = 4;
 // 5 and 6 are the preview's.
 const TIMER_CLOCK: usize = 7;
 const TIMER_STATUS: usize = 8;
+const TIMER_TRAY: usize = 9;
 
 /// Hotkey ids: HOTKEY_APP + n opens pinned app n (0-based); HOTKEY_TOGGLE shows/hides the dock.
 const HOTKEY_APP: i32 = 1;
@@ -75,6 +80,7 @@ const CMD_SOUND: u32 = 10;
 const CMD_MIXER: u32 = 11;
 const CMD_NETWORK: u32 = 12;
 const CMD_POWER: u32 = 13;
+const CMD_SHOW_DESKTOP: u32 = 14;
 /// Menu ids from here up pick a window: CMD_WINDOW + index into `MenuSpec::windows`.
 const CMD_WINDOW: u32 = 100;
 
@@ -117,6 +123,14 @@ enum Kind {
     Clock,
     /// Network, volume and battery icons.
     Status,
+    /// Opens the Start menu; right-click for the Win+X menu.
+    Start,
+    /// Minimizes every window, and brings them back.
+    ShowDesktop,
+    /// Another app's tray icon; the item's id is the icon's.
+    TrayIcon,
+    /// Opens a grid of the tray icons Windows keeps off the taskbar.
+    TrayOverflow,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +187,17 @@ impl Item {
     /// An app icon, as opposed to the clock, status icons or a separator.
     fn is_app(&self) -> bool {
         matches!(self.kind, Kind::Pinned(_) | Kind::Running)
+    }
+
+    /// Grows under the cursor like an app icon.
+    fn magnifies(&self) -> bool {
+        self.is_app() || self.kind == Kind::Start
+    }
+
+    /// Drawn as glyphs or text across the dock's whole thickness, with a highlight instead
+    /// of magnification.
+    fn is_glyph(&self) -> bool {
+        matches!(self.kind, Kind::Clock | Kind::Status | Kind::ShowDesktop | Kind::TrayIcon | Kind::TrayOverflow)
     }
 }
 
@@ -238,6 +263,10 @@ struct Metrics {
     thick: f32,
     radius: f32,
     sep: f32,
+    /// The clock and tray area's own icon size and spacing (small icons look farther apart
+    /// at the apps' spacing).
+    tray_icon: f32,
+    tray_gap: f32,
     mag: f32,
     range: f32,
     bounce: f32,
@@ -269,6 +298,8 @@ impl Metrics {
             thick,
             radius: (a.corner_radius * s).min(thick / 2.0),
             sep: gap.max(4.0 * s),
+            tray_icon: (cfg.tray.icon_size * s).round(),
+            tray_gap: (cfg.tray.spacing * s).round(),
             mag,
             range: cfg.magnification.range,
             bounce,
@@ -351,6 +382,7 @@ pub struct App {
     /// The dock's drawing surface (the preview popup has its own).
     surface: Option<Surface>,
     preview: preview::Preview,
+    flyout: overflow::Flyout,
     /// Screen position of the dock window, and the work area of its monitor.
     origin: (i32, i32),
     work: RECT,
@@ -380,6 +412,16 @@ pub struct App {
     status_glyphs: String,
     status_tip: String,
     has_battery: bool,
+    /// Collects other apps' tray icons while they're shown.
+    tray: Option<tray::Host>,
+    tray_icons: Vec<tray::Icon>,
+    /// Where each tray icon is on screen, as last told to the tray.
+    tray_rects: Vec<(String, RECT)>,
+    /// The last tray icon clicked, to make a second click a double-click.
+    tray_click: Option<(String, Instant)>,
+    tray_hover: Option<String>,
+    /// A clicked tray icon's label stays hidden while the app's own menu or window opens.
+    tray_clicked: Option<String>,
 
     cursor: Option<(f32, f32)>,
     tracking: bool,
@@ -432,6 +474,7 @@ impl App {
         let surface = gpu.as_ref().and_then(|g| g.create_surface(hwnd, 1, 1).inspect_err(|e| crate::log!("surface init failed: {e}")).ok());
         let instance = unsafe { GetModuleHandleW(None) }.map(HINSTANCE::from).unwrap_or_default();
         let preview_hwnd = preview::create_window(instance).inspect_err(|e| crate::log!("preview window failed: {e}")).unwrap_or_default();
+        let flyout_hwnd = overflow::create_window(instance).inspect_err(|e| crate::log!("flyout window failed: {e}")).unwrap_or_default();
         Self {
             hwnd,
             own_pid: unsafe { GetCurrentProcessId() },
@@ -443,6 +486,7 @@ impl App {
             gpu,
             surface,
             preview: preview::Preview::new(preview_hwnd),
+            flyout: overflow::Flyout::new(flyout_hwnd),
             origin: (0, 0),
             work: RECT::default(),
             render_failures: 0,
@@ -468,6 +512,12 @@ impl App {
             status_glyphs: String::new(),
             status_tip: String::new(),
             has_battery: false,
+            tray: None,
+            tray_icons: Vec::new(),
+            tray_rects: Vec::new(),
+            tray_click: None,
+            tray_hover: None,
+            tray_clicked: None,
             cursor: None,
             tracking: false,
             anchor: 0.0,
@@ -524,6 +574,7 @@ impl App {
         }
         self.place();
         self.update_status();
+        self.update_tray();
         self.refresh_windows();
         droptarget::register(self.hwnd);
         self.register_hotkeys();
@@ -541,6 +592,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        self.tray = None;
         self.close_preview();
         droptarget::unregister(self.hwnd);
         self.unregister_hotkeys();
@@ -616,6 +668,7 @@ impl App {
                 self.apply_theme();
                 self.place();
                 self.update_status();
+                self.update_tray();
                 self.rebuild_items();
                 self.check_fullscreen();
                 crate::log!("config reloaded");
@@ -753,6 +806,7 @@ impl App {
         self.origin = (x, y);
         self.work = mi.rcWork;
         self.close_preview();
+        self.close_flyout();
         if let Some(sf) = &mut self.surface {
             let _ = sf.resize(w as u32, h as u32);
         }
@@ -762,7 +816,8 @@ impl App {
         let px = (((self.m.icon * self.m.mag).ceil() as u32).div_ceil(16) * 16).clamp(32, 256);
         if px != self.icon_px {
             self.icon_px = px;
-            self.icons.clear();
+            // Tray icons come from their apps at one size; keep them.
+            self.icons.retain(|k, _| is_tray_image(k));
             self.loader.reset();
             if let Some(g) = &mut self.gpu {
                 g.clear_bitmaps();
@@ -947,6 +1002,10 @@ impl App {
         TRACKED.with(|t| *t.borrow_mut() = list.iter().map(|(h, _)| *h).collect());
         self.windows = list;
         self.fg = apps::foreground().0 as isize;
+        // An app that quit without removing its tray icon.
+        if self.tray.as_ref().is_some_and(|t| t.prune()) {
+            self.update_tray();
+        }
         self.rebuild_items();
         self.refresh_preview();
     }
@@ -986,6 +1045,10 @@ impl App {
 
     fn rebuild_items(&mut self) {
         let mut items = Vec::new();
+        if self.cfg.shows_start() {
+            items.push(Item::new("start".into(), Kind::Start, "Start".into(), String::new(), AppKey::default(), None));
+        }
+        let first_pin = items.len();
         for (i, p) in self.cfg.pinned.clone().iter().enumerate() {
             let path = shell::expand_env(&p.path);
             let (key, default_name) = self.pin_info(&path);
@@ -1000,6 +1063,7 @@ impl App {
             ));
         }
         let pinned = items.len();
+        let pins = first_pin..pinned;
 
         let mut wins: Vec<(isize, AppKey, u64)> = self
             .windows
@@ -1010,12 +1074,12 @@ impl App {
         let mut running: Vec<Item> = Vec::new();
         for (h, key, _) in wins {
             // Exact matches first; then pinned apps claiming their helper processes' windows.
-            let owner = items[..pinned]
+            let owner = items[pins.clone()]
                 .iter()
                 .position(|it| it.key.matches(&key))
-                .or_else(|| items[..pinned].iter().position(|it| it.key.adopts(&key)));
+                .or_else(|| items[pins.clone()].iter().position(|it| it.key.adopts(&key)));
             if let Some(i) = owner {
-                items[i].windows.push(h);
+                items[first_pin + i].windows.push(h);
                 continue;
             }
             if !self.cfg.dock.show_running {
@@ -1037,20 +1101,40 @@ impl App {
             it.windows.push(h);
             running.push(it);
         }
-        if pinned > 0 && !running.is_empty() {
+        if pinned > first_pin && !running.is_empty() {
             items.push(Item::new("sep".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
         }
         items.extend(running);
         let status = self.cfg.shows_status() && !self.status_glyphs.is_empty();
         let clock = self.cfg.shows_clock();
-        if (status || clock) && !items.is_empty() && self.cfg.tray.placement == Placement::Dock {
+        let desktop = self.cfg.shows_desktop_button();
+        let all = self.cfg.tray.apps == TrayApps::All;
+        let shown: Vec<&tray::Icon> = self.tray_icons.iter().filter(|i| !i.hidden && (all || i.promoted)).collect();
+        let overflow = !self.overflow_icons().is_empty();
+        // With the clock and status icons hidden, Show desktop still ends the dock itself.
+        let in_dock = match self.cfg.tray.placement {
+            Placement::Dock => status || clock || desktop || overflow || !shown.is_empty(),
+            Placement::Corner => false,
+            Placement::Hidden => desktop,
+        };
+        if in_dock && !items.is_empty() {
             items.push(Item::new("sep:system".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
+        }
+        if overflow {
+            items.push(Item::new("tray:more".into(), Kind::TrayOverflow, "Show hidden icons".into(), String::new(), AppKey::default(), None));
+        }
+        for icon in shown {
+            let name = icon.tip.lines().next().unwrap_or_default().to_string();
+            items.push(Item::new(icon.id(), Kind::TrayIcon, name, tray_image(icon), AppKey::default(), None));
         }
         if status {
             items.push(Item::new("status".into(), Kind::Status, self.status_tip.clone(), String::new(), AppKey::default(), None));
         }
         if clock {
             items.push(Item::new("clock".into(), Kind::Clock, self.clock_tip.clone(), String::new(), AppKey::default(), None));
+        }
+        if desktop {
+            items.push(Item::new("desktop".into(), Kind::ShowDesktop, "Show desktop".into(), String::new(), AppKey::default(), None));
         }
 
         // Carry animation state across rebuilds; new items grow in, removed ones shrink out.
@@ -1107,14 +1191,23 @@ impl App {
         match it.kind {
             Kind::Separator => self.m.sep,
             Kind::Clock => self.clock_len,
-            Kind::Status => self.status_glyphs.chars().count() as f32 * self.status_cell(),
-            Kind::Pinned(_) | Kind::Running => self.m.icon,
+            Kind::Status => {
+                let n = self.status_glyphs.chars().count() as f32;
+                n * self.m.tray_icon + (n - 1.0).max(0.0) * self.m.tray_gap
+            }
+            Kind::ShowDesktop | Kind::TrayIcon | Kind::TrayOverflow => self.m.tray_icon,
+            Kind::Pinned(_) | Kind::Running | Kind::Start => self.m.icon,
         }
+    }
+
+    /// Space along the dock between this item and its neighbours, half on each side.
+    fn gap(&self, it: &Item) -> f32 {
+        if it.is_glyph() { self.m.tray_gap } else { self.m.gap }
     }
 
     /// In the corner island rather than the dock itself.
     fn in_island(&self, it: &Item) -> bool {
-        self.cfg.tray.placement == Placement::Corner && matches!(it.kind, Kind::Clock | Kind::Status)
+        self.cfg.tray.placement == Placement::Corner && it.is_glyph()
     }
 
     /// Lays icons out at their current magnification, anchored so the point under the
@@ -1123,7 +1216,7 @@ impl App {
     fn compute_layout(&self) -> Layout {
         let m = &self.m;
         let center = self.axis.main() / 2.0;
-        let width = |it: &Item, mag: f32| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) * mag + m.gap) };
+        let width = |it: &Item, mag: f32| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) * mag + self.gap(it)) };
         let w0: Vec<f32> = self.items.iter().map(|it| width(it, 1.0)).collect();
         let w1: Vec<f32> = self.items.iter().map(|it| width(it, it.mag)).collect();
         let (l0, l1): (f32, f32) = (w0.iter().sum(), w1.iter().sum());
@@ -1157,22 +1250,26 @@ impl App {
                 slot
             })
             .collect();
-        // Each slot already has half a gap either side of its icon.
-        let edge = m.pad_main - m.gap / 2.0;
+        // Each slot already has half a gap either side of its icon; the padding at each end is
+        // measured from there.
+        let mut in_bar = self.items.iter().filter(|it| !self.in_island(it));
+        let edge = |it: Option<&Item>| m.pad_main - it.map_or(m.gap, |it| self.gap(it)) / 2.0;
+        let (first, last) = (in_bar.next(), in_bar.next_back());
         let bar = if l1 <= 0.0 {
             (center - m.icon / 2.0 - m.pad_main, center + m.icon / 2.0 + m.pad_main)
         } else {
-            (start - edge, start + l1 + edge)
+            (start - edge(first), start + l1 + edge(last.or(first)))
         };
 
         // The island sits as far from the end of the edge as the dock sits from the edge.
-        let island_len: f32 = self.items.iter().filter(|it| self.in_island(it)).map(|it| it.appear * (self.base_size(it) + m.gap)).sum();
+        let island_len: f32 = self.items.iter().filter(|it| self.in_island(it)).map(|it| it.appear * (self.base_size(it) + m.tray_gap)).sum();
+        let edge = m.pad_main - m.tray_gap / 2.0;
         let island = (island_len > 0.0).then(|| {
             let end = self.axis.main() - m.margin;
             let mut u = end - edge - island_len;
             for (it, slot) in self.items.iter().zip(&mut slots) {
                 if self.in_island(it) {
-                    let w = it.appear * (self.base_size(it) + m.gap);
+                    let w = it.appear * (self.base_size(it) + m.tray_gap);
                     *slot = Slot { u0: u, w, center: u + w / 2.0, size: self.base_size(it) * it.appear };
                     u += w;
                 }
@@ -1200,7 +1297,7 @@ impl App {
     fn icon_uv(&self, i: usize) -> Option<(f32, f32, f32, f32)> {
         let (it, s) = (self.items.get(i)?, self.layout.slots.get(i)?);
         let cu = s.center + it.shift;
-        if matches!(it.kind, Kind::Clock | Kind::Status) {
+        if it.is_glyph() {
             // Text gets the whole thickness of the dock, so two lines fit beside small icons.
             return Some((cu - s.size / 2.0, cu + s.size / 2.0, self.m.margin, self.m.margin + self.m.thick));
         }
@@ -1267,9 +1364,17 @@ impl App {
             }
         let targets = self.magnification_targets(hovering);
         let lit = if hovering && self.drag.is_none() && !self.menu_open { self.hovered_index() } else { None };
+        let tray_hover = lit.filter(|&i| self.items[i].kind == Kind::TrayIcon).map(|i| self.items[i].id.clone());
+        if tray_hover != self.tray_hover {
+            if let Some(icon) = tray_hover.as_deref().and_then(|id| self.tray_icon(id)) {
+                tray::click(icon, tray::Click::Hover, cursor_pos());
+            }
+            self.tray_hover = tray_hover;
+            self.tray_clicked = None;
+        }
         for (i, (it, t)) in self.items.iter_mut().zip(targets).enumerate() {
             moving |= approach(&mut it.mag, t, k(16.0), 0.001);
-            let glow = if lit == Some(i) && matches!(it.kind, Kind::Clock | Kind::Status) { 1.0 } else { 0.0 };
+            let glow = if lit == Some(i) && it.is_glyph() { 1.0 } else { 0.0 };
             moving |= approach(&mut it.glow, glow, k(16.0), 0.01);
         }
         if let Some((_, until)) = &self.notice
@@ -1290,7 +1395,7 @@ impl App {
             _ => (0.0, false),
         };
         // Distances are measured on the unmagnified layout so the effect doesn't feed back on itself.
-        let width = |it: &Item| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) + m.gap) };
+        let width = |it: &Item| if self.in_island(it) { 0.0 } else { it.appear * (self.base_size(it) + self.gap(it)) };
         let total: f32 = self.items.iter().map(width).sum();
         let mut u = self.axis.main() / 2.0 - total / 2.0;
         self.items
@@ -1299,7 +1404,7 @@ impl App {
                 let w = width(it);
                 let center = u + w / 2.0;
                 u += w;
-                if !ok || !it.is_app() {
+                if !ok || !it.magnifies() {
                     return 1.0;
                 }
                 let d = (cu - center).abs() / (m.icon + m.gap);
@@ -1327,11 +1432,12 @@ impl App {
             .hovered_index()
             .filter(|&i| self.cfg.dock.show_labels && self.drag.is_none() && !self.menu_open && !self.preview.showing(&self.items[i].id))
             // The status icons' label would show beneath the Quick Settings they opened.
-            .filter(|&i| !(self.quick_settings_open && self.items[i].kind == Kind::Status));
+            .filter(|&i| !(self.quick_settings_open && self.items[i].kind == Kind::Status))
+            .filter(|&i| self.tray_clicked.as_deref() != Some(self.items[i].id.as_str()));
         let label_req = match (&self.notice, hovered) {
             (Some((text, _)), _) => Some((text.clone(), (b0 + b1) / 2.0, m.margin + m.thick)),
             _ if self.dragging.is_some() => self.drop_label(),
-            (None, Some(i)) => self.icon_uv(i).map(|(u0, u1, _, v1)| (self.items[i].name.clone(), (u0 + u1) / 2.0, v1)),
+            (None, Some(i)) if !self.items[i].name.is_empty() => self.icon_uv(i).map(|(u0, u1, _, v1)| (self.items[i].name.clone(), (u0 + u1) / 2.0, v1)),
             _ => None,
         };
         let label = label_req.and_then(|(text, cu, top)| {
@@ -1353,6 +1459,7 @@ impl App {
         let mut shapes = Vec::new();
         let mut icons = Vec::new();
         let mut texts = Vec::new();
+        let mut tray_rects = Vec::new();
         let drag_id = self.drag.as_ref().map(|d| d.id.as_str());
         for (i, it) in self.items.iter().enumerate() {
             let Some(slot) = self.layout.slots.get(i) else { continue };
@@ -1366,24 +1473,45 @@ impl App {
                 });
                 continue;
             }
-            if matches!(it.kind, Kind::Clock | Kind::Status) {
+            if it.is_glyph() {
                 let Some((u0, u1, v0, v1)) = self.icon_uv(i) else { continue };
                 // These don't magnify, so a soft highlight fades in under the cursor. Its corners
                 // follow the bar's, an even inset in from them.
                 if it.glow > 0.0 {
                     let inset = 6.0 * m.s;
                     let radius = (m.radius - inset).max(4.0 * m.s);
-                    shapes.push(Shape { rect: ax.rect(u0, u1, v0 + inset, v1 - inset), radius, color: pal.separator.alpha(0.6 * it.glow) });
+                    // Half the spacing either side, so the highlights of neighbours just meet.
+                    let side = (m.tray_gap / 2.0).max(4.0 * m.s);
+                    shapes.push(Shape { rect: ax.rect(u0 - side, u1 + side, v0 + inset, v1 - inset), radius, color: pal.separator.alpha(0.6 * it.glow) });
                 }
                 if it.kind == Kind::Clock {
                     texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: self.clock_text.clone(), color: pal.clock.alpha(it.appear), font: Font::Clock });
+                } else if it.kind == Kind::ShowDesktop {
+                    texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: SHOW_DESKTOP_GLYPH.into(), color: pal.status.alpha(it.appear), font: Font::Icons });
+                } else if it.kind == Kind::TrayOverflow {
+                    let glyph = overflow_glyph(ax.pos);
+                    texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: glyph.into(), color: pal.status.alpha(it.appear), font: Font::Icons });
+                } else if it.kind == Kind::TrayIcon {
+                    let size = m.tray_icon;
+                    let (cu, cv) = ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
+                    let rect = ax.rect(cu - size / 2.0, cu + size / 2.0, cv - size / 2.0, cv + size / 2.0);
+                    icons.push(IconDraw { rect, source: &it.icon, opacity: it.appear.min(1.0) });
+                    let r = rect.translate(self.origin.0 as f32 + offset.0, self.origin.1 as f32 + offset.1);
+                    tray_rects.push((it.id.clone(), RECT { left: r.l.round() as i32, top: r.t.round() as i32, right: r.r.round() as i32, bottom: r.b.round() as i32 }));
                 } else {
-                    let n = self.status_glyphs.chars().count().max(1) as f32;
-                    let cell = (u1 - u0) / n;
+                    let pitch = m.tray_icon + m.tray_gap;
                     for (k, g) in self.status_glyphs.chars().enumerate() {
-                        let a = u0 + k as f32 * cell;
-                        texts.push(TextDraw { rect: ax.rect(a, a + cell, v0, v1), text: g.to_string(), color: pal.status.alpha(it.appear), font: Font::Icons });
+                        let c = u0 + k as f32 * pitch + m.tray_icon / 2.0;
+                        texts.push(TextDraw { rect: ax.rect(c - pitch / 2.0, c + pitch / 2.0, v0, v1), text: g.to_string(), color: pal.status.alpha(it.appear), font: Font::Icons });
                     }
+                }
+                continue;
+            }
+            if it.kind == Kind::Start {
+                if let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
+                    let rect = ax.rect(u0, u1, v0, v1);
+                    region.push(rect);
+                    windows_logo(&mut shapes, rect, pal.start.alpha(it.appear));
                 }
                 continue;
             }
@@ -1455,6 +1583,12 @@ impl App {
             }
         }
         drop(frame);
+        if tray_rects != self.tray_rects {
+            if let Some(t) = &self.tray {
+                t.set_rects(tray_rects.clone());
+            }
+            self.tray_rects = tray_rects;
+        }
         // e.g. the GPU was reset; retry a few times rather than spinning forever.
         if (self.gpu.is_none() || self.surface.is_none()) && self.render_failures < 5 {
             self.recreate_renderer();
@@ -1512,11 +1646,6 @@ impl App {
 
     // ---------------------------------------------------------------- status
 
-    /// Each status icon's share of the dock's length.
-    fn status_cell(&self) -> f32 {
-        (self.cfg.tray.icon_size * self.m.s * 1.75).round()
-    }
-
     /// Reads volume, network and battery; starts or stops watching them as the setting changes.
     fn update_status(&mut self) {
         if !self.cfg.shows_status() {
@@ -1567,6 +1696,8 @@ impl App {
                 self.set_fonts();
                 self.preview.reset_surface();
                 self.close_preview();
+                self.flyout.reset_surface();
+                self.close_flyout();
                 self.dirty = true;
             }
             Err(e) => crate::log!("renderer init failed: {e}"),
@@ -1659,6 +1790,11 @@ impl App {
         self.cursor = Some((x, y));
         let id = self.hovered_index().map(|i| self.items[i].id.clone());
         self.close_preview();
+        // Clicking the dock doesn't take the focus from the flyout, so close it here. The
+        // arrow toggles it when the click finishes.
+        if id.as_deref() != Some("tray:more") {
+            self.close_flyout();
+        }
         self.press = Some(Press { id, x, y });
         unsafe {
             SetCapture(self.hwnd);
@@ -1696,6 +1832,30 @@ impl App {
             }
             Kind::Status => {
                 shell::open_quick_settings();
+                return;
+            }
+            Kind::Start => {
+                shell::toggle_start();
+                return;
+            }
+            Kind::ShowDesktop => {
+                shell::toggle_desktop();
+                return;
+            }
+            Kind::TrayIcon => {
+                let id = self.items[i].id.clone();
+                let double = self.tray_click.take().is_some_and(|(last, at)| last == id && at.elapsed() < double_click_time());
+                if !double {
+                    self.tray_click = Some((id.clone(), Instant::now()));
+                }
+                if let Some(icon) = self.tray_icon(&id) {
+                    tray::click(icon, if double { tray::Click::Double } else { tray::Click::Left }, cursor_pos());
+                }
+                self.tray_clicked = Some(id);
+                return;
+            }
+            Kind::TrayOverflow => {
+                self.toggle_flyout();
                 return;
             }
             _ => {}
@@ -1867,10 +2027,32 @@ impl App {
 
     // ----------------------------------------------------------------- menu
 
-    fn menu_spec(&mut self, x: f32, y: f32) -> MenuSpec {
+    /// The dock's menu for a right-click at (x, y), or None when the click opened another menu.
+    fn menu_spec(&mut self, x: f32, y: f32) -> Option<MenuSpec> {
         self.cursor = Some((x, y));
         self.close_preview();
         let idx = self.hovered_index();
+        // Like the taskbar's Start button, right-click opens the Win+X menu.
+        match idx.map(|i| self.items[i].kind) {
+            Some(Kind::Start) => {
+                shell::open_power_menu();
+                return None;
+            }
+            Some(Kind::TrayIcon) => {
+                let id = self.items[idx?].id.clone();
+                if let Some(icon) = self.tray_icon(&id) {
+                    tray::click(icon, tray::Click::Right, cursor_pos());
+                }
+                self.tray_clicked = Some(id);
+                self.dirty = true;
+                return None;
+            }
+            Some(Kind::TrayOverflow) => {
+                self.toggle_flyout();
+                return None;
+            }
+            _ => {}
+        }
         let mut entries = Vec::new();
         let mut windows = Vec::new();
         if let Some(it) = idx.map(|i| &self.items[i]) {
@@ -1916,18 +2098,73 @@ impl App {
             }
             entries.push(MenuEntry::separator());
         }
+        if self.cfg.dock.hide_taskbar {
+            entries.push(MenuEntry::new(CMD_SHOW_DESKTOP, "Show desktop"));
+        }
         entries.push(MenuEntry::new(CMD_IMPORT, "Import taskbar pins"));
         entries.push(MenuEntry::new(CMD_SETTINGS, "Dock settings…"));
         entries.push(MenuEntry::new(CMD_QUIT, "Quit Windock"));
         self.menu_open = true;
-        self.dirty = true;
-        let align = match self.cfg.dock.position {
+        // The menu's loop stops the dock drawing; take the hover label away first.
+        self.render();
+        let align = self.menu_align();
+        Some(MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, windows, align })
+    }
+
+    fn menu_align(&self) -> TRACK_POPUP_MENU_FLAGS {
+        match self.cfg.dock.position {
             Position::Bottom => TPM_BOTTOMALIGN | TPM_CENTERALIGN,
             Position::Top => TPM_TOPALIGN | TPM_CENTERALIGN,
             Position::Left => TPM_LEFTALIGN | TPM_VCENTERALIGN,
             Position::Right => TPM_RIGHTALIGN | TPM_VCENTERALIGN,
-        };
-        MenuSpec { item: idx.map(|i| self.items[i].id.clone()), entries, windows, align }
+        }
+    }
+
+    fn tray_icon(&self, id: &str) -> Option<&tray::Icon> {
+        self.tray_icons.iter().find(|i| i.id() == id)
+    }
+
+    /// Starts or stops collecting tray icons as the settings change, and takes in new ones.
+    fn update_tray(&mut self) {
+        if !self.cfg.shows_tray_apps() {
+            if self.tray.take().is_some() {
+                self.close_flyout();
+                self.tray_icons.clear();
+                self.tray_rects.clear();
+                self.forget_tray_images();
+                self.rebuild_items();
+            }
+            return;
+        }
+        if self.tray.is_none() {
+            self.tray = tray::Host::start(self.hwnd, WM_APP_TRAY);
+            crate::log!("collecting tray icons: {}", self.tray.is_some());
+        }
+        let Some(host) = &self.tray else { return };
+        let icons = host.icons();
+        for (image, pixels) in host.take_images() {
+            self.icons.insert(format!("{TRAY_IMAGE}{image}"), pixels);
+        }
+        self.tray_rects.clear();
+        if icons != self.tray_icons {
+            self.tray_icons = icons;
+            self.rebuild_items();
+            self.refresh_flyout();
+        }
+        self.forget_tray_images();
+        self.dirty = true;
+    }
+
+    /// Drops pictures no tray icon shows any more.
+    fn forget_tray_images(&mut self) {
+        let used: HashSet<String> = self.tray_icons.iter().map(tray_image).collect();
+        let stale: Vec<String> = self.icons.keys().filter(|k| is_tray_image(k) && !used.contains(*k)).cloned().collect();
+        for k in stale {
+            self.icons.remove(&k);
+            if let Some(g) = &mut self.gpu {
+                g.forget_bitmap(&k);
+            }
+        }
     }
 
     fn menu_command(&mut self, spec: &MenuSpec, cmd: u32) {
@@ -1962,6 +2199,7 @@ impl App {
                 self.show_notice(text, INFO_TIME);
             }
             (CMD_SETTINGS, _) => open_settings(),
+            (CMD_SHOW_DESKTOP, _) => shell::toggle_desktop(),
             (CMD_NOTIFICATIONS, _) => {
                 shell::launch("ms-actioncenter:", None, None);
             }
@@ -1982,9 +2220,8 @@ impl App {
                     apps::activate(HWND(w as _));
                 }
             }
-            (CMD_QUIT, _) => unsafe {
-                let _ = DestroyWindow(self.hwnd);
-            },
+            // Not DestroyWindow here: WM_DESTROY would arrive while the app is borrowed.
+            (CMD_QUIT, _) => post(WM_CLOSE, 0),
             _ => {}
         }
         self.schedule_hide(self.cfg.dock.autohide_delay_ms);
@@ -2036,13 +2273,14 @@ impl App {
                     preview::TIMER_PREVIEW => self.preview_timer(),
                     preview::TIMER_PREVIEW_CLOSE => self.close_preview(),
                     TIMER_HIDE => {
-                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() && !self.preview.is_open() {
+                        if self.cursor.is_none() && self.drag.is_none() && !self.menu_open && self.notice.is_none() && !self.preview.is_open() && !self.flyout.is_open() {
                             self.hide_target = 1.0;
                             self.dirty = true;
                         }
                     }
                     TIMER_CLOCK => self.update_clock(),
                     TIMER_STATUS => self.update_status(),
+                    TIMER_TRAY => self.update_tray(),
                     TIMER_NOTICE => {
                         self.notice = None;
                         self.dirty = true;
@@ -2074,6 +2312,10 @@ impl App {
                 if self.cfg.dock.hide_taskbar {
                     taskbar::hide();
                 }
+                // Showing the taskbar can bring it in front of the dock's tray window.
+                if let Some(t) = &self.tray {
+                    t.check();
+                }
             }
             // Signing out: put the taskbar's auto-hide setting back, as quitting would.
             WM_ENDSESSION if wp.0 != 0 => taskbar::restore(),
@@ -2081,6 +2323,8 @@ impl App {
             WM_TIMECHANGE => self.update_clock(),
             // Changes arrive in bursts (e.g. a volume slider dragging); read once they settle.
             WM_APP_STATUS => self.set_timer(TIMER_STATUS, 100),
+            // Apps add their icons in bursts (all at once after TaskbarCreated).
+            WM_APP_TRAY => self.set_timer(TIMER_TRAY, 50),
             WM_APP_QUICK_SETTINGS => {
                 self.quick_settings_open = wp.0 != 0;
                 if self.quick_settings_open {
@@ -2115,7 +2359,6 @@ impl App {
                 self.dirty = true;
             },
             WM_ERASEBKGND => return Some(LRESULT(1)),
-            WM_DESTROY => unsafe { PostQuitMessage(0) },
             m if m != 0 && m == SHELLHOOK_MSG.load(Ordering::Relaxed) => match wp.0 as u32 {
                 HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED => self.set_timer(TIMER_REFRESH, 60),
                 HSHELL_FLASH => {
@@ -2138,10 +2381,62 @@ impl App {
                 self.appbar_register();
                 self.apply_taskbar();
                 self.place();
+                // A restarted Explorer's new taskbar is in front of the dock's tray window.
+                if let Some(t) = &self.tray {
+                    t.check();
+                }
             }
             _ => return None,
         }
         Some(LRESULT(0))
+    }
+}
+
+/// Segoe Fluent Icons' monitor.
+const SHOW_DESKTOP_GLYPH: &str = "\u{E7F4}";
+
+/// The overflow arrow points away from the screen edge.
+fn overflow_glyph(pos: Position) -> &'static str {
+    match pos {
+        Position::Bottom => "\u{E70E}",
+        Position::Top => "\u{E70D}",
+        Position::Left => "\u{E76C}",
+        Position::Right => "\u{E76B}",
+    }
+}
+
+/// Tray icon pictures live in the icon cache under this prefix and their image number.
+const TRAY_IMAGE: &str = "trayimg:";
+
+fn tray_image(icon: &tray::Icon) -> String {
+    format!("{TRAY_IMAGE}{}", icon.image)
+}
+
+fn is_tray_image(key: &str) -> bool {
+    key.starts_with(TRAY_IMAGE)
+}
+
+fn cursor_pos() -> (i32, i32) {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+fn double_click_time() -> Duration {
+    Duration::from_millis(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as u64)
+}
+
+/// The Windows logo, four squares, centred in `rect` at about the taskbar's proportions.
+fn windows_logo(shapes: &mut Vec<Shape>, rect: RectF, color: Color) {
+    let size = rect.w().min(rect.h()) * 0.56;
+    let gap = size * 0.06;
+    let pane = (size - gap) / 2.0;
+    let (l, t) = ((rect.l + rect.r - size) / 2.0, (rect.t + rect.b - size) / 2.0);
+    for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let (x, y) = (l + dx * (pane + gap), t + dy * (pane + gap));
+        shapes.push(Shape { rect: RectF { l: x, t: y, r: x + pane, b: y + pane }, radius: pane * 0.08, color });
     }
 }
 
@@ -2220,10 +2515,15 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Whatever else is running, quitting must end the message loop.
+    if msg == WM_DESTROY {
+        unsafe { PostQuitMessage(0) };
+        return LRESULT(0);
+    }
     if msg == WM_RBUTTONUP {
         let (x, y) = ((lp.0 & 0xffff) as i16 as f32, ((lp.0 >> 16) & 0xffff) as i16 as f32);
         // The menu runs its own message loop, so the app must not stay borrowed while it's open.
-        if let Some(spec) = with_app(|a| a.menu_spec(x, y)) {
+        if let Some(Some(spec)) = with_app(|a| a.menu_spec(x, y)) {
             let cmd = unsafe { show_menu(hwnd, &spec) };
             with_app(|a| a.menu_command(&spec, cmd));
         }

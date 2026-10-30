@@ -13,6 +13,7 @@ mod shell;
 mod softgui;
 mod status;
 mod taskbar;
+mod tray;
 mod util;
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
