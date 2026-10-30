@@ -18,7 +18,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::System::WinRT::Composition::*;
-use windows::core::{HSTRING, Interface, Result, w};
+use windows::core::{BOOL, HSTRING, Interface, Result, w};
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -77,17 +77,20 @@ pub struct LabelDraw {
     pub pad: (f32, f32),
 }
 
-/// Text with no background, centred in `rect`, in the clock font.
+/// Text with no background, centred in `rect`.
 pub struct TextDraw {
     pub rect: RectF,
     pub text: String,
     pub color: Color,
+    pub font: Font,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Font {
     Label,
     Clock,
+    /// Windows' icon font, for the status icons.
+    Icons,
 }
 
 pub struct Frame<'a> {
@@ -154,6 +157,7 @@ pub struct Gpu {
     dwrite: IDWriteFactory,
     label_format: Option<IDWriteTextFormat>,
     clock_format: Option<IDWriteTextFormat>,
+    icon_format: Option<IDWriteTextFormat>,
     layouts: HashMap<LayoutKey, (IDWriteTextLayout, f32, f32)>,
     bitmaps: HashMap<String, ID2D1Bitmap1>,
 }
@@ -211,6 +215,7 @@ impl Gpu {
                 dwrite: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
                 label_format: None,
                 clock_format: None,
+                icon_format: None,
                 layouts: HashMap::new(),
                 bitmaps: HashMap::new(),
             })
@@ -283,7 +288,24 @@ impl Gpu {
     /// Lines centred both ways, so the clock's time and date line up whatever their widths.
     pub fn set_clock_font(&mut self, family: &str, size_px: f32) {
         self.layouts.retain(|k, _| k.0 != Font::Clock);
-        self.clock_format = unsafe {
+        self.clock_format = self.centred_format(family, size_px);
+    }
+
+    /// Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets (mostly the same glyphs) on 10.
+    pub fn set_icon_font(&mut self, size_px: f32) {
+        self.layouts.retain(|k, _| k.0 != Font::Icons);
+        let installed = |family: &str| unsafe {
+            let mut fonts = None;
+            let (mut index, mut exists) = (0, BOOL(0));
+            self.dwrite.GetSystemFontCollection(&mut fonts, false).is_ok()
+                && fonts.is_some_and(|f| f.FindFamilyName(&HSTRING::from(family), &mut index, &mut exists).is_ok() && exists.as_bool())
+        };
+        let family = if installed("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
+        self.icon_format = self.centred_format(family, size_px);
+    }
+
+    fn centred_format(&self, family: &str, size_px: f32) -> Option<IDWriteTextFormat> {
+        unsafe {
             self.dwrite
                 .CreateTextFormat(&HSTRING::from(family), None, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size_px, w!(""))
                 .inspect(|f| {
@@ -292,7 +314,7 @@ impl Gpu {
                     let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 })
                 .ok()
-        };
+        }
     }
 
     fn layout(&mut self, font: Font, text: &str, max_width: f32, height: f32) -> Option<&(IDWriteTextLayout, f32, f32)> {
@@ -304,6 +326,7 @@ impl Gpu {
             let format = match font {
                 Font::Label => self.label_format.as_ref()?,
                 Font::Clock => self.clock_format.as_ref()?,
+                Font::Icons => self.icon_format.as_ref()?,
             };
             let utf16: Vec<u16> = text.encode_utf16().collect();
             unsafe {
@@ -371,7 +394,7 @@ impl Gpu {
         let prepared = Prepared {
             bitmaps: f.icons.iter().map(|i| self.bitmap(i.source, pixels)).collect(),
             labels: f.labels.iter().map(|l| self.layout(Font::Label, &l.text, l.max_width, 1000.0).map(|(t, _, _)| t.clone())).collect(),
-            texts: f.texts.iter().map(|t| self.layout(Font::Clock, &t.text, t.rect.w(), t.rect.h()).map(|(l, _, _)| l.clone())).collect(),
+            texts: f.texts.iter().map(|t| self.layout(t.font, &t.text, t.rect.w(), t.rect.h()).map(|(l, _, _)| l.clone())).collect(),
         };
 
         // Only redraw what changed: this frame's content plus whatever was drawn last frame.

@@ -7,7 +7,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - macOS-style magnification (optional), frosted-glass background, light/dark theme that follows Windows
 - Bottom, top, left or right edge, any monitor, optional auto-hide
 - Can hide the Windows taskbar while it runs, and puts it back when it quits
-- A clock, shown automatically when the taskbar is hidden, in Windows' regional format or your own
+- A clock and network, volume and battery icons, shown automatically when the taskbar is hidden
 - Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
 - Keyboard shortcuts for pinned apps and for showing the dock
 - Hot-reloaded TOML config
@@ -28,6 +28,8 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Drop files onto an app | Open them with that app |
 | Drop files, shortcuts or folders between apps | Pin them at that position (programs and shortcuts always pin) |
 | Click the clock | Notifications and calendar (right-click: Adjust date and time) |
+| Click the network/volume icons | Quick Settings (right-click: sound, mixer, network and power settings) |
+| Scroll over them / middle-click | Change the volume / mute |
 | Ctrl+Alt+1–9 (0 for the 10th) | Open or switch to that pinned app, like clicking it |
 | Win+Shift+D | Show or hide the dock (with auto-hide: slide it in) |
 
@@ -88,6 +90,13 @@ date = "short"           # none | short | long, or a pattern like "ddd d MMM"
 size = 12
 # color = "#f5f5f7"
 
+[tray]                   # status icons beside the clock
+show = "auto"            # auto | always | never
+network = true
+volume = true
+battery = true           # only on devices with a battery
+icon_size = 16
+
 [[pinned]]
 path = 'C:\Windows\explorer.exe'          # .exe, .lnk, folder, or
 name = "File Explorer"                    # 'shell:AppsFolder\<AppUserModelID>' for Store apps
@@ -119,6 +128,7 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | `src/app/preview.rs` | The hover popup with live DWM window thumbnails |
 | `src/app/droptarget.rs` | Files dragged onto the dock: open with an app, or pin |
 | `src/clock.rs` | The clock's text, formatted by Windows |
+| `src/status.rs` | Volume, network and battery, watched through Core Audio, IP Helper, WLAN and power notifications |
 | `src/hotkeys.rs` | Parsing shortcut strings like `win+shift+d` |
 | `src/settings.rs` | The settings window (`windock.exe --settings`, egui) |
 | `src/softgui.rs`, `src/softgui/raster.rs` | Hosts the settings window and draws it on the CPU, so it needs no GPU driver (~10 MB instead of ~170 MB) |

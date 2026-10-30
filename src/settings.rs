@@ -364,7 +364,8 @@ impl Settings {
     fn clock(&mut self, ui: &mut egui::Ui) -> bool {
         let mut c = false;
         let taskbar_hidden = self.cfg.dock.hide_taskbar;
-        let theme_colour = Config { clock: Default::default(), ..self.cfg.clone() }.palette(self.dark(), self.cfg.appearance.blur).clock;
+        let theme = Config { clock: Default::default(), tray: Default::default(), ..self.cfg.clone() }.palette(self.dark(), self.cfg.appearance.blur);
+        let theme_colour = theme.clock;
         let k = &mut self.cfg.clock;
 
         section(ui, "Clock");
@@ -456,6 +457,40 @@ impl Settings {
             ui.label(egui::RichText::new(note).weak());
         }
         ui.label(egui::RichText::new("Click the clock for notifications and the calendar. Patterns use Windows' format letters.").weak());
+
+        section(ui, "Status icons");
+        let t = &mut self.cfg.tray;
+        grid(ui, "status", |ui| {
+            ui.label("Show");
+            ui.horizontal(|ui| {
+                for (s, label) in [(Show::Auto, "Automatically"), (Show::Always, "Always"), (Show::Never, "Never")] {
+                    c |= ui.selectable_value(&mut t.show, s, label).changed();
+                }
+            });
+            ui.end_row();
+            c |= slider(ui, "Icon size", &mut t.icon_size, 10.0..=32.0, " px");
+            let mut custom_colour = t.color.is_some();
+            if ui.checkbox(&mut custom_colour, "Icon colour").changed() {
+                t.color = custom_colour.then_some(theme.status);
+                c = true;
+            }
+            let mut rgba = to_rgba(t.color.unwrap_or(theme.status));
+            if ui.add_enabled_ui(custom_colour, |ui| ui.color_edit_button_srgba_unmultiplied(&mut rgba)).inner.changed() {
+                t.color = Some(Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]));
+                c = true;
+            }
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        c |= toggle(ui, &mut t.network, "Network", "");
+        c |= toggle(ui, &mut t.volume, "Volume", "Scroll over the icons to change it; middle-click to mute");
+        c |= toggle(ui, &mut t.battery, "Battery", "Only on devices with a battery");
+        ui.add_space(6.0);
+        let note = match t.show {
+            Show::Auto if !taskbar_hidden => "Hidden for now: they appear while the Windows taskbar is hidden.",
+            _ => "Click them for Quick Settings: Wi-Fi, Bluetooth, volume, brightness and more.",
+        };
+        ui.label(egui::RichText::new(note).weak());
         c
     }
 
@@ -522,7 +557,7 @@ impl softgui::App for Settings {
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                for (t, label) in [(Tab::General, "General"), (Tab::Appearance, "Appearance"), (Tab::Clock, "Clock"), (Tab::Apps, "Apps")] {
+                for (t, label) in [(Tab::General, "General"), (Tab::Appearance, "Appearance"), (Tab::Clock, "Clock & status"), (Tab::Apps, "Apps")] {
                     ui.selectable_value(&mut self.tab, t, egui::RichText::new(label).size(15.0));
                 }
             });

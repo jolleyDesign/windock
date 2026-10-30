@@ -7,9 +7,10 @@ use crate::apps::{self, AppKey};
 use crate::clock;
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Position};
 use crate::icons::{IconLoader, IconPixels};
-use crate::render::{Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
+use crate::render::{Font, Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
 use crate::hotkeys;
 use crate::shell;
+use crate::status;
 use crate::taskbar;
 use crate::util::{from_wide, wide};
 use std::cell::RefCell;
@@ -41,6 +42,8 @@ const WM_APP_CONFIG: u32 = WM_APP + 4;
 const WM_APP_APPBAR: u32 = WM_APP + 5;
 const WM_APP_DROP: u32 = WM_APP + 6;
 const WM_APP_TASKBAR_SHOWN: u32 = WM_APP + 7;
+/// Volume, network or battery changed (posted from system threads).
+const WM_APP_STATUS: u32 = WM_APP + 8;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
@@ -48,6 +51,7 @@ const TIMER_HIDE: usize = 3;
 const TIMER_NOTICE: usize = 4;
 // 5 and 6 are the preview's.
 const TIMER_CLOCK: usize = 7;
+const TIMER_STATUS: usize = 8;
 
 /// Hotkey ids: HOTKEY_APP + n opens pinned app n (0-based); HOTKEY_TOGGLE shows/hides the dock.
 const HOTKEY_APP: i32 = 1;
@@ -62,6 +66,10 @@ const CMD_QUIT: u32 = 6;
 const CMD_IMPORT: u32 = 7;
 const CMD_NOTIFICATIONS: u32 = 8;
 const CMD_DATE_TIME: u32 = 9;
+const CMD_SOUND: u32 = 10;
+const CMD_MIXER: u32 = 11;
+const CMD_NETWORK: u32 = 12;
+const CMD_POWER: u32 = 13;
 /// Menu ids from here up pick a window: CMD_WINDOW + index into `MenuSpec::windows`.
 const CMD_WINDOW: u32 = 100;
 
@@ -102,6 +110,8 @@ enum Kind {
     Running,
     Separator,
     Clock,
+    /// Network, volume and battery icons.
+    Status,
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +162,7 @@ impl Item {
         !self.dying && self.kind != Kind::Separator
     }
 
-    /// An app icon, as opposed to the clock or a separator.
+    /// An app icon, as opposed to the clock, status icons or a separator.
     fn is_app(&self) -> bool {
         matches!(self.kind, Kind::Pinned(_) | Kind::Running)
     }
@@ -355,6 +365,11 @@ pub struct App {
     clock_text: String,
     clock_tip: String,
     clock_len: f32,
+    status: Option<status::Watcher>,
+    /// One glyph per status icon, and the hover text.
+    status_glyphs: String,
+    status_tip: String,
+    has_battery: bool,
 
     cursor: Option<(f32, f32)>,
     tracking: bool,
@@ -437,6 +452,10 @@ impl App {
             clock_text: String::new(),
             clock_tip: String::new(),
             clock_len: 0.0,
+            status: None,
+            status_glyphs: String::new(),
+            status_tip: String::new(),
+            has_battery: false,
             cursor: None,
             tracking: false,
             anchor: 0.0,
@@ -491,6 +510,7 @@ impl App {
             }
         }
         self.place();
+        self.update_status();
         self.refresh_windows();
         droptarget::register(self.hwnd);
         self.register_hotkeys();
@@ -582,6 +602,7 @@ impl App {
                 self.notice = None;
                 self.apply_theme();
                 self.place();
+                self.update_status();
                 self.rebuild_items();
                 self.check_fullscreen();
                 crate::log!("config reloaded");
@@ -1007,10 +1028,15 @@ impl App {
             items.push(Item::new("sep".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
         }
         items.extend(running);
-        if self.cfg.shows_clock() {
-            if !items.is_empty() {
-                items.push(Item::new("sep:clock".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
-            }
+        let status = self.cfg.shows_status() && !self.status_glyphs.is_empty();
+        let clock = self.cfg.shows_clock();
+        if (status || clock) && !items.is_empty() {
+            items.push(Item::new("sep:system".into(), Kind::Separator, String::new(), String::new(), AppKey::default(), None));
+        }
+        if status {
+            items.push(Item::new("status".into(), Kind::Status, self.status_tip.clone(), String::new(), AppKey::default(), None));
+        }
+        if clock {
             items.push(Item::new("clock".into(), Kind::Clock, self.clock_tip.clone(), String::new(), AppKey::default(), None));
         }
 
@@ -1068,6 +1094,7 @@ impl App {
         match it.kind {
             Kind::Separator => self.m.sep,
             Kind::Clock => self.clock_len,
+            Kind::Status => self.status_glyphs.chars().count() as f32 * self.status_cell(),
             Kind::Pinned(_) | Kind::Running => self.m.icon,
         }
     }
@@ -1138,7 +1165,7 @@ impl App {
     fn icon_uv(&self, i: usize) -> Option<(f32, f32, f32, f32)> {
         let (it, s) = (self.items.get(i)?, self.layout.slots.get(i)?);
         let cu = s.center + it.shift;
-        if it.kind == Kind::Clock {
+        if matches!(it.kind, Kind::Clock | Kind::Status) {
             // Text gets the whole thickness of the dock, so two lines fit beside small icons.
             return Some((cu - s.size / 2.0, cu + s.size / 2.0, self.m.margin, self.m.margin + self.m.thick));
         }
@@ -1281,6 +1308,7 @@ impl App {
         let mut shapes = Vec::new();
         let mut icons = Vec::new();
         let mut texts = Vec::new();
+        let hovered_any = if self.drag.is_none() && !self.menu_open { self.hovered_index() } else { None };
         let drag_id = self.drag.as_ref().map(|d| d.id.as_str());
         for (i, it) in self.items.iter().enumerate() {
             let Some(slot) = self.layout.slots.get(i) else { continue };
@@ -1294,9 +1322,22 @@ impl App {
                 });
                 continue;
             }
-            if it.kind == Kind::Clock {
-                if let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
-                    texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: self.clock_text.clone(), color: pal.clock.alpha(it.appear) });
+            if matches!(it.kind, Kind::Clock | Kind::Status) {
+                let Some((u0, u1, v0, v1)) = self.icon_uv(i) else { continue };
+                // These don't magnify, so a soft highlight shows what's under the cursor.
+                if hovered_any == Some(i) {
+                    let inset = 4.0 * m.s;
+                    shapes.push(Shape { rect: ax.rect(u0, u1, v0 + inset, v1 - inset), radius: 6.0 * m.s, color: pal.separator.alpha(0.6) });
+                }
+                if it.kind == Kind::Clock {
+                    texts.push(TextDraw { rect: ax.rect(u0, u1, v0, v1), text: self.clock_text.clone(), color: pal.clock.alpha(it.appear), font: Font::Clock });
+                } else {
+                    let n = self.status_glyphs.chars().count().max(1) as f32;
+                    let cell = (u1 - u0) / n;
+                    for (k, g) in self.status_glyphs.chars().enumerate() {
+                        let a = u0 + k as f32 * cell;
+                        texts.push(TextDraw { rect: ax.rect(a, a + cell, v0, v1), text: g.to_string(), color: pal.status.alpha(it.appear), font: Font::Icons });
+                    }
                 }
                 continue;
             }
@@ -1379,6 +1420,7 @@ impl App {
         if let Some(g) = &mut self.gpu {
             g.set_label_font(&a.label_font, a.label_size * s);
             g.set_clock_font(&a.label_font, self.cfg.clock.size * s);
+            g.set_icon_font(self.cfg.tray.icon_size * s);
         }
         self.update_clock();
     }
@@ -1419,6 +1461,51 @@ impl App {
             self.dirty = true;
         }
         self.set_timer(TIMER_CLOCK, face.next_change.as_millis() as u32 + 15);
+    }
+
+    // ---------------------------------------------------------------- status
+
+    /// Each status icon's share of the dock's length.
+    fn status_cell(&self) -> f32 {
+        (self.cfg.tray.icon_size * self.m.s * 1.75).round()
+    }
+
+    /// Reads volume, network and battery; starts or stops watching them as the setting changes.
+    fn update_status(&mut self) {
+        if !self.cfg.shows_status() {
+            self.status = None;
+            self.status_glyphs.clear();
+            return;
+        }
+        let watcher = self.status.get_or_insert_with(|| status::Watcher::new(|| post(WM_APP_STATUS, 0)));
+        let s = watcher.read();
+        let t = &self.cfg.tray;
+        let mut glyphs = String::new();
+        if t.network {
+            glyphs.push(status::network_glyph(&s.network));
+        }
+        if t.volume && let Some(v) = &s.volume {
+            glyphs.push(status::volume_glyph(v));
+        }
+        if t.battery && let Some(b) = &s.battery {
+            glyphs.push(status::battery_glyph(b));
+        }
+        let tip = status::describe(&s, t.volume, t.network, t.battery);
+        self.has_battery = s.battery.is_some();
+        if glyphs != self.status_glyphs || tip != self.status_tip {
+            // A new icon (or one fewer) changes the item list; otherwise just redraw.
+            let count_changed = glyphs.is_empty() != self.status_glyphs.is_empty();
+            self.status_glyphs = glyphs;
+            self.status_tip = tip;
+            if let Some(it) = self.items.iter_mut().find(|it| it.kind == Kind::Status) {
+                it.name = self.status_tip.clone();
+            }
+            if count_changed {
+                self.rebuild_items();
+            }
+            self.layout = self.compute_layout();
+            self.dirty = true;
+        }
     }
 
     fn recreate_renderer(&mut self) {
@@ -1549,9 +1636,16 @@ impl App {
     }
 
     fn click(&mut self, i: usize) {
-        if self.items[i].kind == Kind::Clock {
-            shell::launch("ms-actioncenter:", None, None);
-            return;
+        match self.items[i].kind {
+            Kind::Clock => {
+                shell::launch("ms-actioncenter:", None, None);
+                return;
+            }
+            Kind::Status => {
+                shell::open_quick_settings();
+                return;
+            }
+            _ => {}
         }
         let wins = self.items[i].windows.clone();
         if wins.is_empty() {
@@ -1697,6 +1791,14 @@ impl App {
                 entries.push(MenuEntry::new(CMD_NOTIFICATIONS, "Notifications and calendar"));
                 entries.push(MenuEntry::new(CMD_DATE_TIME, "Adjust date and time"));
             }
+            if it.kind == Kind::Status {
+                entries.push(MenuEntry::new(CMD_SOUND, "Sound settings"));
+                entries.push(MenuEntry::new(CMD_MIXER, "Volume mixer"));
+                entries.push(MenuEntry::new(CMD_NETWORK, "Network settings"));
+                if self.has_battery {
+                    entries.push(MenuEntry::new(CMD_POWER, "Power & battery"));
+                }
+            }
             match it.windows.len() {
                 0 => {}
                 1 => entries.push(MenuEntry::new(CMD_CLOSE, "Close window")),
@@ -1756,6 +1858,15 @@ impl App {
             (CMD_DATE_TIME, _) => {
                 shell::launch("ms-settings:dateandtime", None, None);
             }
+            (CMD_SOUND | CMD_MIXER | CMD_NETWORK | CMD_POWER, _) => {
+                let page = match cmd {
+                    CMD_SOUND => "ms-settings:sound",
+                    CMD_MIXER => "ms-settings:apps-volume",
+                    CMD_NETWORK => "ms-settings:network",
+                    _ => "ms-settings:batterysaver",
+                };
+                shell::launch(page, None, None);
+            }
             (c, _) if c >= CMD_WINDOW => {
                 if let Some(&w) = spec.windows.get((c - CMD_WINDOW) as usize) {
                     apps::activate(HWND(w as _));
@@ -1781,8 +1892,22 @@ impl App {
             WM_LBUTTONUP => self.on_up(x, y),
             WM_MBUTTONUP => {
                 self.cursor = Some((x, y));
-                if let Some(i) = self.hovered_index() {
-                    self.launch(i);
+                match self.hovered_index() {
+                    Some(i) if self.items[i].kind == Kind::Status => {
+                        if let Some(w) = &self.status {
+                            w.toggle_mute();
+                        }
+                    }
+                    Some(i) => self.launch(i),
+                    None => {}
+                }
+            }
+            // Scrolling over the status icons changes the volume, 2% a notch.
+            WM_MOUSEWHEEL => {
+                let notches = ((wp.0 >> 16) as u16 as i16) as f32 / WHEEL_DELTA as f32;
+                match (self.hovered_index(), &self.status) {
+                    (Some(i), Some(w)) if self.items[i].kind == Kind::Status => w.change_volume(notches * 0.02),
+                    _ => return None,
                 }
             }
             WM_CAPTURECHANGED => {
@@ -1807,6 +1932,7 @@ impl App {
                         }
                     }
                     TIMER_CLOCK => self.update_clock(),
+                    TIMER_STATUS => self.update_status(),
                     TIMER_NOTICE => {
                         self.notice = None;
                         self.dirty = true;
@@ -1843,6 +1969,14 @@ impl App {
             WM_ENDSESSION if wp.0 != 0 => taskbar::restore(),
             WM_DISPLAYCHANGE | WM_DPICHANGED => self.place(),
             WM_TIMECHANGE => self.update_clock(),
+            // Changes arrive in bursts (e.g. a volume slider dragging); read once they settle.
+            WM_APP_STATUS => self.set_timer(TIMER_STATUS, 100),
+            WM_POWERBROADCAST => {
+                if wp.0 as u32 == PBT_APMPOWERSTATUSCHANGE {
+                    self.set_timer(TIMER_STATUS, 100);
+                }
+                return None;
+            }
             WM_SETTINGCHANGE => {
                 let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as _).to_string() }.unwrap_or_default() } else { String::new() };
                 if wp.0 as u32 == SPI_SETWORKAREA.0 {

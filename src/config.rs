@@ -313,13 +313,44 @@ impl Default for Clock {
     }
 }
 
-impl Config {
-    pub fn shows_clock(&self) -> bool {
-        match self.clock.show {
-            Show::Auto => self.dock.hide_taskbar,
+/// The status icons (volume, network, battery) beside the clock.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Tray {
+    pub show: Show,
+    pub volume: bool,
+    pub network: bool,
+    /// Only on devices that have a battery.
+    pub battery: bool,
+    pub icon_size: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+}
+
+impl Default for Tray {
+    fn default() -> Self {
+        Self { show: Show::Auto, volume: true, network: true, battery: true, icon_size: 16.0, color: None }
+    }
+}
+
+impl Show {
+    fn resolve(self, taskbar_hidden: bool) -> bool {
+        match self {
+            Show::Auto => taskbar_hidden,
             Show::Always => true,
             Show::Never => false,
         }
+    }
+}
+
+impl Config {
+    pub fn shows_clock(&self) -> bool {
+        self.clock.show.resolve(self.dock.hide_taskbar)
+    }
+
+    pub fn shows_status(&self) -> bool {
+        let t = &self.tray;
+        t.show.resolve(self.dock.hide_taskbar) && (t.volume || t.network || t.battery)
     }
 }
 
@@ -343,6 +374,7 @@ pub struct Config {
     pub animation: Animation,
     pub shortcuts: Shortcuts,
     pub clock: Clock,
+    pub tray: Tray,
     pub pinned: Vec<Pinned>,
 }
 
@@ -359,6 +391,7 @@ pub struct Palette {
     pub label_text: Color,
     pub placeholder: Color,
     pub clock: Color,
+    pub status: Color,
 }
 
 impl Config {
@@ -373,6 +406,7 @@ impl Config {
         a.corner_radius = a.corner_radius.max(0.0);
         a.label_size = a.label_size.clamp(6.0, 48.0);
         self.clock.size = self.clock.size.clamp(6.0, 48.0);
+        self.tray.icon_size = self.tray.icon_size.clamp(8.0, 48.0);
         let m = &mut self.magnification;
         m.scale = m.scale.clamp(1.0, 4.0);
         m.range = m.range.clamp(1.0, 10.0);
@@ -395,6 +429,7 @@ impl Config {
                 label_text: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
                 placeholder: Color::rgba(0x5a, 0x5a, 0x60, 0xff),
                 clock: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
+                status: Color::rgba(0xf5, 0xf5, 0xf7, 0xff),
             }
         } else {
             Palette {
@@ -408,6 +443,7 @@ impl Config {
                 label_text: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
                 placeholder: Color::rgba(0xb8, 0xb8, 0xc0, 0xff),
                 clock: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
+                status: Color::rgba(0x1d, 0x1d, 0x1f, 0xff),
             }
         };
         Palette {
@@ -421,6 +457,7 @@ impl Config {
             label_text: a.label_text.unwrap_or(def.label_text),
             placeholder: def.placeholder,
             clock: self.clock.color.unwrap_or(def.clock),
+            status: self.tray.color.unwrap_or(def.clock),
         }
     }
 }
@@ -462,7 +499,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
-    for section in ["dock", "appearance", "magnification", "animation", "shortcuts", "clock"] {
+    for section in ["dock", "appearance", "magnification", "animation", "shortcuts", "clock", "tray"] {
         let Some(values) = fresh.get(section).and_then(|i| i.as_table()) else { continue };
         if !doc.contains_table(section) {
             doc[section] = toml_edit::table();
@@ -667,6 +704,16 @@ seconds = false
 date = "short"               # none | short | long, or a pattern like "ddd d MMM"
 size = 12
 # color = "#f5f5f7"          # leave out to follow the theme
+
+# Status icons beside the clock. Click them for Quick Settings, scroll over them to change
+# the volume, middle-click to mute.
+[tray]
+show = "auto"                # auto (while the Windows taskbar is hidden) | always | never
+volume = true
+network = true
+battery = true               # only on devices with a battery
+icon_size = 16
+# color = "#f5f5f7"
 "##;
 
 const PINNED_COMMENT: &str = r"

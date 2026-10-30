@@ -11,6 +11,7 @@ mod render;
 mod settings;
 mod shell;
 mod softgui;
+mod status;
 mod taskbar;
 mod util;
 

@@ -280,3 +280,17 @@ pub fn set_menu_theme(mode: crate::config::Theme) {
         }
     }
 }
+
+/// Opens Quick Settings (Wi-Fi, volume, battery) by pressing Win+A: unlike the notification
+/// centre, it has no URI that works on current Windows 11.
+pub fn open_quick_settings() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_A, VK_LWIN};
+    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() } },
+    };
+    let keys = [key(VK_LWIN, false), key(VK_A, false), key(VK_A, true), key(VK_LWIN, true)];
+    unsafe {
+        SendInput(&keys, size_of::<INPUT>() as i32);
+    }
+}
