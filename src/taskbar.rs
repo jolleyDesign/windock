@@ -1,4 +1,5 @@
-//! Reads the apps pinned to the Windows taskbar, in taskbar order.
+//! The Windows taskbar: reading its pinned apps, in taskbar order, and hiding it while the
+//! dock runs.
 //!
 //! Pinned desktop apps are shortcuts in `User Pinned\TaskBar`. Pinned Store apps have no
 //! shortcut and only appear (as AppUserModelIDs) in the undocumented `Taskband\Favorites`
@@ -7,8 +8,10 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
+use windows::Win32::UI::Shell::{ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetClassNameW, IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
 use windows::core::w;
 
 pub enum Pin {
@@ -141,6 +144,88 @@ fn is_store_app_id(s: &str) -> bool {
         && publisher.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && app.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && !app.contains('!')
+}
+
+// ---------------------------------------------------------------- hiding
+
+/// Holds the taskbar's own auto-hide setting while it's hidden. It's a file so that if the
+/// dock is killed, the next start can still put things back.
+fn hidden_marker() -> PathBuf {
+    crate::util::data_dir().join("taskbar-hidden")
+}
+
+/// The main taskbar and the one on each other monitor.
+fn taskbar_windows() -> Vec<HWND> {
+    let mut found = Vec::new();
+    unsafe {
+        if let Ok(h) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            found.push(h);
+        }
+        let mut after = None;
+        while let Ok(h) = FindWindowExW(None, after, w!("Shell_SecondaryTrayWnd"), None) {
+            found.push(h);
+            after = Some(h);
+        }
+    }
+    found
+}
+
+pub fn is_taskbar(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    matches!(String::from_utf16_lossy(&buf[..n]).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+fn appbar_state(set: Option<u32>) -> u32 {
+    let Some(tray) = taskbar_windows().first().copied() else { return 0 };
+    let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: tray, ..Default::default() };
+    unsafe {
+        match set {
+            Some(state) => {
+                abd.lParam = LPARAM(state as isize);
+                SHAppBarMessage(ABM_SETSTATE, &mut abd) as u32
+            }
+            None => SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32,
+        }
+    }
+}
+
+/// Hides the taskbar on every monitor. It's switched to auto-hide first: a hidden window
+/// still reserves its space, an auto-hiding one doesn't. Safe to call repeatedly.
+pub fn hide() {
+    let marker = hidden_marker();
+    if !marker.exists() {
+        let state = appbar_state(None);
+        if let Err(e) = std::fs::write(&marker, state.to_string()) {
+            crate::log!("couldn't save the taskbar's state, leaving it alone: {e}");
+            return;
+        }
+        if state & ABS_AUTOHIDE == 0 {
+            appbar_state(Some(state | ABS_AUTOHIDE));
+        }
+    }
+    for h in taskbar_windows() {
+        if unsafe { IsWindowVisible(h) }.as_bool() {
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+        }
+    }
+}
+
+/// Undoes `hide`, including one from a previous run that didn't exit cleanly.
+pub fn restore() {
+    let marker = hidden_marker();
+    let Ok(text) = std::fs::read_to_string(&marker) else { return };
+    for h in taskbar_windows() {
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOWNA);
+        }
+    }
+    if let Ok(state) = text.trim().parse::<u32>() {
+        appbar_state(Some(state));
+    }
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[cfg(test)]

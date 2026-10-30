@@ -6,6 +6,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - Live window previews on hover, like the Windows taskbar
 - macOS-style magnification (optional), frosted-glass background, light/dark theme that follows Windows
 - Bottom, top, left or right edge, any monitor, optional auto-hide
+- Can hide the Windows taskbar while it runs, and puts it back when it quits
 - Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
 - Keyboard shortcuts for pinned apps and for showing the dock
 - Hot-reloaded TOML config
@@ -40,6 +41,7 @@ position = "bottom"      # bottom | top | left | right
 monitor = "primary"      # or 0, 1, ...
 autohide = false
 reserve_space = false    # keep maximized windows from covering the dock
+hide_taskbar = false     # hide the Windows taskbar, clock and tray icons included
 show_running = true
 show_all_desktops = false
 show_labels = true
@@ -108,7 +110,8 @@ On Windows itself, `cargo build --release` works with the MSVC toolchain.
 | `src/app/droptarget.rs` | Files dragged onto the dock: open with an app, or pin |
 | `src/hotkeys.rs` | Parsing shortcut strings like `win+shift+d` |
 | `src/settings.rs` | The settings window (`windock.exe --settings`, egui) |
-| `src/taskbar.rs` | Reads the taskbar's pinned apps for importing |
+| `src/softgui.rs`, `src/softgui/raster.rs` | Hosts the settings window and draws it on the CPU, so it needs no GPU driver (~10 MB instead of ~170 MB) |
+| `src/taskbar.rs` | Reads the taskbar's pinned apps for importing, and hides the taskbar |
 | `src/logo.rs`, `build.rs` | The app icon, drawn in code and embedded at build time |
 | `src/apps.rs` | Finds taskbar-worthy windows and groups them by AppUserModelID / executable |
 | `src/render.rs` | A shared Direct2D device plus a composition surface per window, each with a host-backdrop (blur) visual |

@@ -9,6 +9,7 @@ mod logo;
 mod render;
 mod settings;
 mod shell;
+mod softgui;
 mod taskbar;
 mod util;
 

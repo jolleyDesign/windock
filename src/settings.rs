@@ -4,7 +4,7 @@
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Pinned, Position, Theme};
 use crate::hotkeys;
 use crate::shell;
-use eframe::egui;
+use crate::softgui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,15 +32,12 @@ pub fn run() {
             return;
         }
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
-            .with_icon(egui::IconData { rgba: crate::logo::rgba(64), width: 64, height: 64 })
-            .with_inner_size([580.0, 680.0])
-            .with_min_inner_size([480.0, 420.0]),
-        ..Default::default()
-    };
-    if let Err(e) = eframe::run_native(TITLE, options, Box::new(|cc| Ok(Box::new(Settings::new(&cc.egui_ctx))))) {
+    let viewport = egui::ViewportBuilder::default()
+        .with_title(TITLE)
+        .with_icon(egui::IconData { rgba: crate::logo::rgba(64), width: 64, height: 64 })
+        .with_inner_size([580.0, 680.0])
+        .with_min_inner_size([480.0, 420.0]);
+    if let Err(e) = softgui::run(viewport, Settings::new) {
         crate::log!("settings window failed: {e}");
     }
 }
@@ -220,6 +217,7 @@ impl Settings {
             let help = if d.autohide { "Not used with auto-hide" } else { "Maximized windows stop at the dock" };
             c |= toggle(ui, &mut d.reserve_space, "Reserve space", help);
         });
+        c |= toggle(ui, &mut d.hide_taskbar, "Hide the Windows taskbar", "Its clock and tray icons are hidden too; it comes back when Windock quits");
         c |= toggle(ui, &mut d.always_on_top, "Always on top", "");
         c |= toggle(ui, &mut d.hide_on_fullscreen, "Hide for full screen", "Games and videos");
         c |= toggle(ui, &mut d.show_running, "Show running apps", "Includes apps that aren't pinned");
@@ -408,8 +406,8 @@ impl Settings {
     }
 }
 
-impl eframe::App for Settings {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl softgui::App for Settings {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll_file();
         if self.pending.is_some_and(|t| t.elapsed() >= SAVE_DELAY) {
             self.save_now();
@@ -482,7 +480,7 @@ impl eframe::App for Settings {
         ui.ctx().request_repaint_after(wait);
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if self.pending.is_some() {
             self.save_now();
         }

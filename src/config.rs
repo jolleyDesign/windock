@@ -108,6 +108,7 @@ pub struct Dock {
     pub autohide: bool,
     pub autohide_delay_ms: u32,
     pub reserve_space: bool,
+    pub hide_taskbar: bool,
     pub always_on_top: bool,
     pub show_running: bool,
     pub show_all_desktops: bool,
@@ -127,6 +128,7 @@ impl Default for Dock {
             autohide: false,
             autohide_delay_ms: 400,
             reserve_space: false,
+            hide_taskbar: false,
             always_on_top: true,
             show_running: true,
             show_all_desktops: false,
@@ -530,6 +532,7 @@ monitor = "primary"          # "primary" or a monitor number (0, 1, ...)
 autohide = false             # slide the dock away until the mouse touches the screen edge
 autohide_delay_ms = 400
 reserve_space = false        # stop maximized windows from covering the dock
+hide_taskbar = false         # hide the Windows taskbar (and its clock and tray icons) while the dock runs
 always_on_top = true
 show_running = true          # also show running apps that aren't pinned
 show_all_desktops = false    # include apps on other virtual desktops

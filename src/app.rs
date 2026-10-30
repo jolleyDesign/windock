@@ -39,6 +39,7 @@ const WM_APP_ICONS: u32 = WM_APP + 3;
 const WM_APP_CONFIG: u32 = WM_APP + 4;
 const WM_APP_APPBAR: u32 = WM_APP + 5;
 const WM_APP_DROP: u32 = WM_APP + 6;
+const WM_APP_TASKBAR_SHOWN: u32 = WM_APP + 7;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_CONFIG: usize = 2;
@@ -461,6 +462,7 @@ impl App {
             }
         }
         self.appbar_register();
+        self.apply_taskbar();
         self.apply_theme();
         shell::set_autostart(self.cfg.dock.autostart);
         if self.first_run {
@@ -498,6 +500,16 @@ impl App {
             let _ = DeregisterShellHookWindow(self.hwnd);
         }
         self.appbar_message(ABM_REMOVE);
+        taskbar::restore();
+    }
+
+    /// Also cleans up after a previous run that hid the taskbar and then didn't exit cleanly.
+    fn apply_taskbar(&self) {
+        if self.cfg.dock.hide_taskbar {
+            taskbar::hide();
+        } else {
+            taskbar::restore();
+        }
     }
 
     fn wants_frame(&self) -> bool {
@@ -532,6 +544,9 @@ impl App {
                 }
                 if old.shortcuts != self.cfg.shortcuts {
                     self.register_hotkeys();
+                }
+                if old.dock.hide_taskbar != self.cfg.dock.hide_taskbar {
+                    self.apply_taskbar();
                 }
                 if old.dock.show_all_desktops != self.cfg.dock.show_all_desktops {
                     self.refresh_windows();
@@ -1717,6 +1732,14 @@ impl App {
                 ABN_FULLSCREENAPP => self.check_fullscreen(),
                 _ => {}
             },
+            // Explorer shows the taskbar again now and then, e.g. for a new monitor.
+            WM_APP_TASKBAR_SHOWN => {
+                if self.cfg.dock.hide_taskbar {
+                    taskbar::hide();
+                }
+            }
+            // Signing out: put the taskbar's auto-hide setting back, as quitting would.
+            WM_ENDSESSION if wp.0 != 0 => taskbar::restore(),
             WM_DISPLAYCHANGE | WM_DPICHANGED => self.place(),
             WM_SETTINGCHANGE => {
                 if wp.0 as u32 == SPI_SETWORKAREA.0 {
@@ -1752,6 +1775,7 @@ impl App {
                     let _ = RegisterShellHookWindow(self.hwnd);
                 }
                 self.appbar_register();
+                self.apply_taskbar();
                 self.place();
             }
             _ => return None,
@@ -1822,6 +1846,7 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     match event {
         EVENT_SYSTEM_FOREGROUND => post(WM_APP_FOREGROUND, id as usize),
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED if tracked => post(WM_APP_REFRESH, 0),
+        EVENT_OBJECT_SHOW if taskbar::is_taskbar(hwnd) => post(WM_APP_TASKBAR_SHOWN, 0),
         EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED | EVENT_OBJECT_NAMECHANGE if !tracked => unsafe {
             if GetAncestor(hwnd, GA_ROOT) == hwnd && IsWindowVisible(hwnd).as_bool() {
                 post(WM_APP_REFRESH, 0);

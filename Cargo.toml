@@ -11,7 +11,10 @@ toml_edit = "0.23"
 windows-numerics = "0.3"
 # For #[implement] (the drop target COM object).
 windows-core = "0.62"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+# The settings window: egui, drawn on the CPU (see softgui.rs).
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [dependencies.windows]
 version = "0.62"
