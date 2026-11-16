@@ -41,9 +41,7 @@ pub fn launch(path: &str, args: Option<&str>, cwd: Option<&str>) -> bool {
     // Default the working directory to the program's folder, like Explorer does.
     let dir = cwd.map(str::to_owned).or_else(|| {
         let p = Path::new(path);
-        (apps_folder_aumid(path).is_none() && p.is_file())
-            .then(|| p.parent().map(|d| d.to_string_lossy().into_owned()))
-            .flatten()
+        (apps_folder_aumid(path).is_none() && p.is_file()).then(|| p.parent().map(|d| d.to_string_lossy().into_owned())).flatten()
     });
     let dir = dir.map(|d| wide(&d));
     let mut info = SHELLEXECUTEINFOW {
@@ -86,11 +84,7 @@ pub fn resolve_lnk(path: &str) -> (Option<String>, Option<String>) {
             return (None, None);
         }
         let mut buf = [0u16; 1024];
-        let target = link
-            .GetPath(&mut buf, std::ptr::null_mut(), 0)
-            .ok()
-            .map(|_| from_wide(&buf))
-            .filter(|s| !s.is_empty());
+        let target = link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok().map(|_| from_wide(&buf)).filter(|s| !s.is_empty());
         let aumid = windows::core::Interface::cast::<IPropertyStore>(&link)
             .ok()
             .and_then(|store| store.GetValue(&PKEY_AppUserModel_ID).ok())
@@ -167,9 +161,7 @@ pub fn file_description(path: &str) -> Option<String> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let mut len = 0u32;
         let mut langs = vec![(0x0409u16, 0x04b0u16)];
-        if VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool()
-            && len >= 4
-        {
+        if VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool() && len >= 4 {
             let pairs = std::slice::from_raw_parts(ptr as *const u16, (len / 2) as usize);
             langs = pairs.chunks_exact(2).map(|c| (c[0], c[1])).chain(langs).collect();
         }
@@ -202,32 +194,19 @@ pub fn display_name(parsing_name: &str) -> Option<String> {
 pub fn friendly_name(path: &str) -> String {
     let p = Path::new(path);
     let is_exe = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
-    if is_exe
-        && let Some(d) = file_description(path) {
-            return d;
-        }
+    if is_exe && let Some(d) = file_description(path) {
+        return d;
+    }
     if let Some(d) = display_name(path) {
         return d;
     }
-    p.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+    p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
 }
 
 fn reg_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
     let mut data = 0u32;
     let mut size = 4u32;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey,
-            value,
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut data as *mut u32 as *mut c_void),
-            Some(&mut size),
-        )
-    };
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, subkey, value, RRF_RT_REG_DWORD, None, Some(&mut data as *mut u32 as *mut c_void), Some(&mut size)) };
     (r == ERROR_SUCCESS).then_some(data)
 }
 
@@ -247,14 +226,7 @@ pub fn set_autostart(enabled: bool) {
         if enabled {
             let Ok(exe) = std::env::current_exe() else { return };
             let cmd = wide(&format!("\"{}\"", exe.display()));
-            let _ = RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                run,
-                w!("Windock"),
-                REG_SZ.0,
-                Some(cmd.as_ptr() as *const c_void),
-                (cmd.len() * 2) as u32,
-            );
+            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, run, w!("Windock"), REG_SZ.0, Some(cmd.as_ptr() as *const c_void), (cmd.len() * 2) as u32);
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, run, w!("Windock"));
         }

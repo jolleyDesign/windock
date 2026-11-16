@@ -6,8 +6,7 @@ use super::*;
 use windows::Win32::Foundation::POINTL;
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, RegisterDragDrop,
-    ReleaseStgMedium, RevokeDragDrop,
+    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::core::{Ref, implement};
@@ -62,13 +61,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
 
 /// Paths from a drag of files (CF_HDROP), e.g. from Explorer.
 fn dropped_files(data: &IDataObject) -> Vec<String> {
-    let format = FORMATETC {
-        cfFormat: CF_HDROP.0,
-        ptd: std::ptr::null_mut(),
-        dwAspect: DVASPECT_CONTENT.0,
-        lindex: -1,
-        tymed: TYMED_HGLOBAL.0 as u32,
-    };
+    let format = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
     let mut paths = Vec::new();
     unsafe {
         let Ok(mut medium) = data.GetData(&format) else { return paths };
@@ -85,9 +78,7 @@ fn dropped_files(data: &IDataObject) -> Vec<String> {
 }
 
 fn is_app_file(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .is_some_and(|e| ["exe", "lnk", "url", "appref-ms", "bat", "cmd"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+    Path::new(path).extension().is_some_and(|e| ["exe", "lnk", "url", "appref-ms", "bat", "cmd"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 /// Needs OLE initialised on this thread.
@@ -178,12 +169,7 @@ impl App {
         {
             return DropAction::OpenWith(i);
         }
-        let at = self
-            .items
-            .iter()
-            .zip(&self.layout.slots)
-            .filter(|(it, s)| matches!(it.kind, Kind::Pinned(_)) && !it.dying && s.center < u)
-            .count();
+        let at = self.items.iter().zip(&self.layout.slots).filter(|(it, s)| matches!(it.kind, Kind::Pinned(_)) && !it.dying && s.center < u).count();
         DropAction::Pin(at)
     }
 

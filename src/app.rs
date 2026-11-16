@@ -8,9 +8,9 @@ mod preview;
 use crate::apps::{self, AppKey};
 use crate::clock;
 use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position, Show, TrayApps};
+use crate::hotkeys;
 use crate::icons::{IconLoader, IconPixels};
 use crate::render::{Font, Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
-use crate::hotkeys;
 use crate::shell;
 use crate::status;
 use crate::taskbar;
@@ -33,7 +33,9 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, INFINITE, WaitForSi
 use windows::Win32::System::WinRT::{CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey,
+};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
@@ -164,22 +166,7 @@ struct Item {
 
 impl Item {
     fn new(id: String, kind: Kind, name: String, icon: String, key: AppKey, launch: Option<Launch>) -> Self {
-        Self {
-            id,
-            kind,
-            name,
-            icon,
-            key,
-            windows: Vec::new(),
-            launch,
-            mag: 1.0,
-            appear: 1.0,
-            dying: false,
-            shift: 0.0,
-            bounce: None,
-            bounce_end: 0.0,
-            glow: 0.0,
-        }
+        Self { id, kind, name, icon, key, windows: Vec::new(), launch, mag: 1.0, appear: 1.0, dying: false, shift: 0.0, bounce: None, bounce_end: 0.0, glow: 0.0 }
     }
 
     fn interactive(&self) -> bool {
@@ -701,9 +688,7 @@ impl App {
                 continue; // not an installed app
             }
             let (key, name) = self.pin_info(&source);
-            let duplicate = existing
-                .iter()
-                .any(|(k, n, p)| k.matches(&key) || n.eq_ignore_ascii_case(&name) || p.eq_ignore_ascii_case(&source));
+            let duplicate = existing.iter().any(|(k, n, p)| k.matches(&key) || n.eq_ignore_ascii_case(&name) || p.eq_ignore_ascii_case(&source));
             if duplicate {
                 continue;
             }
@@ -1039,31 +1024,17 @@ impl App {
             let path = shell::expand_env(&p.path);
             let (key, default_name) = self.pin_info(&path);
             let launch = Launch { path: path.clone(), args: p.args.clone(), cwd: p.working_dir.clone() };
-            items.push(Item::new(
-                format!("p:{}", path.to_lowercase()),
-                Kind::Pinned(i),
-                p.name.clone().unwrap_or(default_name),
-                path,
-                key,
-                Some(launch),
-            ));
+            items.push(Item::new(format!("p:{}", path.to_lowercase()), Kind::Pinned(i), p.name.clone().unwrap_or(default_name), path, key, Some(launch)));
         }
         let pinned = items.len();
         let pins = first_pin..pinned;
 
-        let mut wins: Vec<(isize, AppKey, u64)> = self
-            .windows
-            .iter()
-            .map(|(h, k)| (*h, k.clone(), self.keys.get(h).map(|(_, s)| *s).unwrap_or(0)))
-            .collect();
+        let mut wins: Vec<(isize, AppKey, u64)> = self.windows.iter().map(|(h, k)| (*h, k.clone(), self.keys.get(h).map(|(_, s)| *s).unwrap_or(0))).collect();
         wins.sort_by_key(|w| w.2);
         let mut running: Vec<Item> = Vec::new();
         for (h, key, _) in wins {
             // Exact matches first; then pinned apps claiming their helper processes' windows.
-            let owner = items[pins.clone()]
-                .iter()
-                .position(|it| it.key.matches(&key))
-                .or_else(|| items[pins.clone()].iter().position(|it| it.key.adopts(&key)));
+            let owner = items[pins.clone()].iter().position(|it| it.key.matches(&key)).or_else(|| items[pins.clone()].iter().position(|it| it.key.adopts(&key)));
             if let Some(i) = owner {
                 items[first_pin + i].windows.push(h);
                 continue;
@@ -1241,11 +1212,7 @@ impl App {
         let mut in_bar = self.items.iter().filter(|it| !self.in_island(it));
         let edge = |it: Option<&Item>| m.pad_main - it.map_or(m.gap, |it| self.gap(it)) / 2.0;
         let (first, last) = (in_bar.next(), in_bar.next_back());
-        let bar = if l1 <= 0.0 {
-            (center - m.icon / 2.0 - m.pad_main, center + m.icon / 2.0 + m.pad_main)
-        } else {
-            (start - edge(first), start + l1 + edge(last.or(first)))
-        };
+        let bar = if l1 <= 0.0 { (center - m.icon / 2.0 - m.pad_main, center + m.icon / 2.0 + m.pad_main) } else { (start - edge(first), start + l1 + edge(last.or(first))) };
 
         // The island sits as far from the end of the edge as the dock sits from the edge.
         let island_len: f32 = self.items.iter().filter(|it| self.in_island(it)).map(|it| it.appear * (self.base_size(it) + m.tray_gap)).sum();
@@ -1300,9 +1267,7 @@ impl App {
         if on_bar(self.layout.bar) || self.layout.island.is_some_and(on_bar) {
             return true;
         }
-        (0..self.items.len()).any(|i| {
-            self.icon_uv(i).is_some_and(|(u0, u1, v0, v1)| u >= u0 && u <= u1 && v >= v0 && v <= v1)
-        })
+        (0..self.items.len()).any(|i| self.icon_uv(i).is_some_and(|(u0, u1, v0, v1)| u >= u0 && u <= u1 && v >= v0 && v <= v1))
     }
 
     fn hovered_index(&self) -> Option<usize> {
@@ -1310,11 +1275,7 @@ impl App {
             return None;
         }
         let (u, _) = self.cursor_uv()?;
-        self.layout
-            .slots
-            .iter()
-            .zip(&self.items)
-            .position(|(s, it)| it.interactive() && u >= s.u0 && u < s.u0 + s.w)
+        self.layout.slots.iter().zip(&self.items).position(|(s, it)| it.interactive() && u >= s.u0 && u < s.u0 + s.w)
     }
 
     // ------------------------------------------------------------ animation
@@ -1344,10 +1305,9 @@ impl App {
         self.items.retain(|it| !(it.dying && it.appear <= 0.0));
 
         let hovering = self.hovering();
-        if hovering
-            && let Some((u, _)) = self.cursor_uv() {
-                self.anchor = u;
-            }
+        if hovering && let Some((u, _)) = self.cursor_uv() {
+            self.anchor = u;
+        }
         let targets = self.magnification_targets(hovering);
         let lit = if hovering && self.drag.is_none() && !self.menu.is_open() { self.hovered_index() } else { None };
         let tray_hover = lit.filter(|&i| self.items[i].kind == Kind::TrayIcon).map(|i| self.items[i].id.clone());
@@ -1364,9 +1324,10 @@ impl App {
             moving |= approach(&mut it.glow, glow, k(16.0), 0.01);
         }
         if let Some((_, until)) = &self.notice
-            && Instant::now() >= *until {
-                self.notice = None;
-            }
+            && Instant::now() >= *until
+        {
+            self.notice = None;
+        }
 
         self.layout = self.compute_layout();
         self.render();
@@ -1488,14 +1449,20 @@ impl App {
                     let pitch = m.tray_icon + m.tray_gap;
                     for (k, g) in self.status_glyphs.chars().enumerate() {
                         let c = u0 + k as f32 * pitch + m.tray_icon / 2.0;
-                        texts.push(TextDraw { rect: ax.rect(c - pitch / 2.0, c + pitch / 2.0, v0, v1), text: g.to_string(), color: pal.status.alpha(it.appear), font: Font::Icons });
+                        texts.push(TextDraw {
+                            rect: ax.rect(c - pitch / 2.0, c + pitch / 2.0, v0, v1),
+                            text: g.to_string(),
+                            color: pal.status.alpha(it.appear),
+                            font: Font::Icons,
+                        });
                     }
                 }
                 continue;
             }
             if it.kind == Kind::Start {
                 if drag_id != Some(it.id.as_str())
-                    && let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
+                    && let Some((u0, u1, v0, v1)) = self.icon_uv(i)
+                {
                     let rect = ax.rect(u0, u1, v0, v1);
                     region.push(rect);
                     windows_logo(&mut shapes, rect, pal.start.alpha(it.appear));
@@ -1503,11 +1470,12 @@ impl App {
                 continue;
             }
             if drag_id != Some(it.id.as_str())
-                && let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
-                    let rect = ax.rect(u0, u1, v0, v1);
-                    region.push(rect);
-                    icons.push(IconDraw { rect, source: &it.icon, opacity: it.appear.min(1.0) });
-                }
+                && let Some((u0, u1, v0, v1)) = self.icon_uv(i)
+            {
+                let rect = ax.rect(u0, u1, v0, v1);
+                region.push(rect);
+                icons.push(IconDraw { rect, source: &it.icon, opacity: it.appear.min(1.0) });
+            }
             if it.windows.is_empty() || self.cfg.appearance.indicator == IndicatorStyle::None {
                 continue;
             }
@@ -1538,16 +1506,17 @@ impl App {
         }
         // The icon being dragged follows the cursor.
         if let (Some(d), Some((x, y))) = (&self.drag, self.cursor)
-            && let Some(it) = self.items.iter().find(|it| it.id == d.id) {
-                let size = m.icon * if d.removing { 1.0 } else { it.mag };
-                let rect = RectF { l: x - size / 2.0, t: y - size / 2.0, r: x + size / 2.0, b: y + size / 2.0 };
-                let opacity = if d.removing { 0.5 } else { 0.92 };
-                if it.kind == Kind::Start {
-                    windows_logo(&mut shapes, rect, pal.start.alpha(opacity));
-                } else {
-                    icons.push(IconDraw { rect, source: &it.icon, opacity });
-                }
+            && let Some(it) = self.items.iter().find(|it| it.id == d.id)
+        {
+            let size = m.icon * if d.removing { 1.0 } else { it.mag };
+            let rect = RectF { l: x - size / 2.0, t: y - size / 2.0, r: x + size / 2.0, b: y + size / 2.0 };
+            let opacity = if d.removing { 0.5 } else { 0.92 };
+            if it.kind == Kind::Start {
+                windows_logo(&mut shapes, rect, pal.start.alpha(opacity));
+            } else {
+                icons.push(IconDraw { rect, source: &it.icon, opacity });
             }
+        }
 
         let frame = Frame {
             offset,
@@ -1652,10 +1621,14 @@ impl App {
         if t.network {
             glyphs.push(status::network_glyph(&s.network));
         }
-        if t.volume && let Some(v) = &s.volume {
+        if t.volume
+            && let Some(v) = &s.volume
+        {
             glyphs.push(status::volume_glyph(v));
         }
-        if t.battery && let Some(b) = &s.battery {
+        if t.battery
+            && let Some(b) = &s.battery
+        {
             glyphs.push(status::battery_glyph(b));
         }
         let tip = status::describe(&s, t.volume, t.network, t.battery);
@@ -1729,12 +1702,7 @@ impl App {
     // ---------------------------------------------------------------- input
 
     fn track_leave(&mut self) {
-        let mut tme = TRACKMOUSEEVENT {
-            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TME_LEAVE,
-            hwndTrack: self.hwnd,
-            dwHoverTime: 0,
-        };
+        let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
         unsafe {
             let _ = TrackMouseEvent(&mut tme);
         }
@@ -1810,9 +1778,10 @@ impl App {
         if self.drag.is_some() {
             self.finish_drag();
         } else if let Some(id) = press.and_then(|p| p.id)
-            && let Some(i) = self.hovered_index().filter(|&i| self.items[i].id == id) {
-                self.click(i);
-            }
+            && let Some(i) = self.hovered_index().filter(|&i| self.items[i].id == id)
+        {
+            self.click(i);
+        }
         // Re-arm leave tracking; it reports right away if the cursor is already outside.
         self.track_leave();
         self.dirty = true;
@@ -1981,20 +1950,10 @@ impl App {
         if target == from {
             return;
         }
-        let width = self
-            .items
-            .iter()
-            .position(|it| it.id == id)
-            .and_then(|i| self.layout.slots.get(i))
-            .map_or(m.icon + m.gap, |s| s.w);
+        let width = self.items.iter().position(|it| it.id == id).and_then(|i| self.layout.slots.get(i)).map_or(m.icon + m.gap, |s| s.w);
         // Items the dragged icon passes over slide out of its way.
         let (range, shift) = if target > from { (from + 1..=target, width) } else { (target..=from - 1, -width) };
-        let moved: Vec<String> = self
-            .items
-            .iter()
-            .filter(|it| matches!(it.kind, Kind::Pinned(j) if range.contains(&j)) && !it.dying)
-            .map(|it| it.id.clone())
-            .collect();
+        let moved: Vec<String> = self.items.iter().filter(|it| matches!(it.kind, Kind::Pinned(j) if range.contains(&j)) && !it.dying).map(|it| it.id.clone()).collect();
         let p = self.cfg.pinned.remove(from);
         self.cfg.pinned.insert(target, p);
         self.rebuild_items();
@@ -2012,9 +1971,10 @@ impl App {
             self.save_config();
         }
         if d.removing
-            && let Some(i) = self.pinned_index(&d.id) {
-                self.cfg.pinned.remove(i);
-            }
+            && let Some(i) = self.pinned_index(&d.id)
+        {
+            self.cfg.pinned.remove(i);
+        }
         if self.cfg.pinned != d.original {
             self.save_pins();
         }
@@ -2384,11 +2344,13 @@ impl App {
                 HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED => self.set_timer(TIMER_REFRESH, 60),
                 HSHELL_FLASH => {
                     let h = lp.0;
-                    if self.attention.insert(h) && self.cfg.animation.bounce_on_launch
-                        && let Some(it) = self.items.iter_mut().find(|it| it.windows.contains(&h)) {
-                            it.bounce = Some(0.0);
-                            it.bounce_end = BOUNCE_PERIOD * 2.0;
-                        }
+                    if self.attention.insert(h)
+                        && self.cfg.animation.bounce_on_launch
+                        && let Some(it) = self.items.iter_mut().find(|it| it.windows.contains(&h))
+                    {
+                        it.bounce = Some(0.0);
+                        it.bounce_end = BOUNCE_PERIOD * 2.0;
+                    }
                     self.dirty = true;
                 }
                 _ => {}
@@ -2497,11 +2459,7 @@ pub(crate) fn monitors() -> Vec<(HMONITOR, MONITORINFO)> {
 /// Posts a message whenever a file in the config folder changes.
 fn watch_config(dir: PathBuf) {
     std::thread::spawn(move || unsafe {
-        let Ok(handle) = FindFirstChangeNotificationW(
-            &HSTRING::from(dir.as_os_str()),
-            false,
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME,
-        ) else {
+        let Ok(handle) = FindFirstChangeNotificationW(&HSTRING::from(dir.as_os_str()), false, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME) else {
             crate::log!("cannot watch {}", dir.display());
             return;
         };

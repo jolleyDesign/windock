@@ -89,7 +89,8 @@ pub(super) fn create_window(instance: HINSTANCE) -> Result<HWND> {
         };
         RegisterClassExW(&wc);
         // It takes the focus while open, so clicking anywhere else closes it and the keys work.
-        let hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, class, w!("Windock menu"), WS_POPUP, 0, 0, 1, 1, None, None, Some(instance), None)?;
+        let hwnd =
+            CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, class, w!("Windock menu"), WS_POPUP, 0, 0, 1, 1, None, None, Some(instance), None)?;
         let on = BOOL(1);
         let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(17), &on as *const _ as _, 4);
         Ok(hwnd)

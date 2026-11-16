@@ -137,8 +137,7 @@ fn triangle(pixels: &mut [[u8; 4]], stride: usize, tex: &Texture, mut v: [&Verte
     // In texel units, offset so that texel centres land on whole numbers.
     let uvs = v.map(|v| [v.uv.x * tex.size[0] as f32 - 0.5, v.uv.y * tex.size[1] as f32 - 0.5]);
     // Most triangles are one solid colour: shade them once.
-    let flat = (v[0].color == v[1].color && v[0].color == v[2].color && v[0].uv == v[1].uv && v[0].uv == v[2].uv)
-        .then(|| mul(colors[0], tex.sample(uvs[0])));
+    let flat = (v[0].color == v[1].color && v[0].color == v[2].color && v[0].uv == v[1].uv && v[0].uv == v[2].uv).then(|| mul(colors[0], tex.sample(uvs[0])));
 
     for y in y0..y1 {
         let line = &mut pixels[y as usize * stride..(y as usize + 1) * stride];

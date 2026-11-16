@@ -305,10 +305,7 @@ impl Settings {
                 c |= ui.add(egui::Slider::new(&mut m.scale, 1.0..=3.0).step_by(0.05).custom_formatter(|v, _| format!("{v:.2}×"))).changed();
                 ui.end_row();
                 ui.label("Spread");
-                c |= ui
-                    .add(egui::Slider::new(&mut m.range, 1.0..=6.0).step_by(0.5).suffix(" icons"))
-                    .on_hover_text("How many neighbouring icons grow too")
-                    .changed();
+                c |= ui.add(egui::Slider::new(&mut m.range, 1.0..=6.0).step_by(0.5).suffix(" icons")).on_hover_text("How many neighbouring icons grow too").changed();
                 ui.end_row();
             });
         });
@@ -336,8 +333,7 @@ impl Settings {
 
         section(ui, "Colours");
         ui.label(egui::RichText::new("Unticked colours follow the theme.").weak());
-        let theme = Config { appearance: config::Appearance { ..Default::default() }, ..Default::default() }
-            .palette(self.dark(), self.cfg.appearance.blur);
+        let theme = Config { appearance: config::Appearance { ..Default::default() }, ..Default::default() }.palette(self.dark(), self.cfg.appearance.blur);
         let a = &mut self.cfg.appearance;
         grid(ui, "colours", |ui| {
             let slots: [(&str, &mut Option<Color>, Color); 7] = [
@@ -529,7 +525,9 @@ impl Settings {
             });
             ui.end_row();
         });
-        ui.label(egui::RichText::new("Like the taskbar: the icons Windows shows there, the rest behind an arrow. Choose which in Windows Settings › Personalization › Taskbar.").weak());
+        ui.label(
+            egui::RichText::new("Like the taskbar: the icons Windows shows there, the rest behind an arrow. Choose which in Windows Settings › Personalization › Taskbar.").weak(),
+        );
         ui.add_space(6.0);
         let note = match t.show {
             Show::Auto if !taskbar_hidden => "Hidden for now: they appear while the Windows taskbar is hidden.",
@@ -584,10 +582,11 @@ impl Settings {
         ui.add_space(8.0);
         if ui.button("Add app…").clicked()
             && let Some(path) = pick_app()
-                && !self.cfg.pinned.iter().any(|p| p.path.eq_ignore_ascii_case(&path)) {
-                    self.cfg.pinned.push(Pinned { path, ..Default::default() });
-                    c = true;
-                }
+            && !self.cfg.pinned.iter().any(|p| p.path.eq_ignore_ascii_case(&path))
+        {
+            self.cfg.pinned.push(Pinned { path, ..Default::default() });
+            c = true;
+        }
         c
     }
 }
@@ -635,14 +634,10 @@ impl softgui::App for Settings {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.broken {
-                egui::Frame::new()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .inner_margin(10.0)
-                    .corner_radius(6.0)
-                    .show(ui, |ui| {
-                        ui.colored_label(ui.visuals().warn_fg_color, format!("config.toml has an error: {err}"));
-                        ui.label("Fix it in the file (Open config file below); this window updates once it's valid.");
-                    });
+                egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(10.0).corner_radius(6.0).show(ui, |ui| {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("config.toml has an error: {err}"));
+                    ui.label("Fix it in the file (Open config file below); this window updates once it's valid.");
+                });
                 ui.add_space(8.0);
             }
             let enabled = self.broken.is_none();

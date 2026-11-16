@@ -10,8 +10,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
-use windows::Win32::UI::Shell::{ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage};
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Shell::{ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage};
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetClassNameW, IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
 use windows::core::w;
 
@@ -25,8 +25,7 @@ pub fn pinned() -> Vec<Pin> {
     let blob = favorites_blob().unwrap_or_default();
     let mut found: Vec<(Option<usize>, String, Pin)> = Vec::new();
 
-    let dir = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default())
-        .join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
+    let dir = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
     for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
@@ -58,15 +57,7 @@ fn favorites_blob() -> Option<Vec<u8>> {
             return None;
         }
         let mut data = vec![0u8; size as usize];
-        let r = RegGetValueW(
-            HKEY_CURRENT_USER,
-            key,
-            value,
-            RRF_RT_REG_BINARY,
-            None,
-            Some(data.as_mut_ptr() as *mut c_void),
-            Some(&mut size),
-        );
+        let r = RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_BINARY, None, Some(data.as_mut_ptr() as *mut c_void), Some(&mut size));
         (r == ERROR_SUCCESS).then(|| {
             data.truncate(size as usize);
             data
@@ -105,13 +96,7 @@ fn find_utf16(blob: &[u8], text: &str) -> Option<usize> {
 fn store_app_ids(blob: &[u8]) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for align in 0..2 {
-        let units: Vec<(usize, u16)> = blob
-            .get(align..)
-            .unwrap_or_default()
-            .chunks_exact(2)
-            .enumerate()
-            .map(|(i, c)| (align + i * 2, u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        let units: Vec<(usize, u16)> = blob.get(align..).unwrap_or_default().chunks_exact(2).enumerate().map(|(i, c)| (align + i * 2, u16::from_le_bytes([c[0], c[1]]))).collect();
         let mut token = String::new();
         let mut start = 0;
         for (pos, unit) in units.iter().copied().chain(std::iter::once((usize::MAX, 0))) {

@@ -7,20 +7,19 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Foundation::{HANDLE, NO_ERROR};
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
 use windows::Win32::Media::Audio::{
-    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
-    MMDeviceEnumerator, eConsole, eRender,
+    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, GetBestInterface, GetIfEntry2, GetNetworkConnectivityHint, IF_TYPE_IEEE80211, MIB_IF_ROW2, MIB_IPINTERFACE_ROW,
-    MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange, NotifyNetworkConnectivityHintChange,
+    CancelMibChangeNotify2, GetBestInterface, GetIfEntry2, GetNetworkConnectivityHint, IF_TYPE_IEEE80211, MIB_IF_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    NotifyIpInterfaceChange, NotifyNetworkConnectivityHintChange,
 };
 use windows::Win32::NetworkManagement::WiFi::{
-    L2_NOTIFICATION_DATA, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WLAN_NOTIFICATION_SOURCE_ACM, WLAN_NOTIFICATION_SOURCE_MSM,
-    WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WlanRegisterNotification,
-    wlan_interface_state_connected, wlan_intf_opcode_current_connection,
+    L2_NOTIFICATION_DATA, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WLAN_NOTIFICATION_SOURCE_ACM, WLAN_NOTIFICATION_SOURCE_MSM, WlanCloseHandle, WlanEnumInterfaces,
+    WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WlanRegisterNotification, wlan_interface_state_connected, wlan_intf_opcode_current_connection,
 };
 use windows::Win32::Networking::WinSock::{
     AF_UNSPEC, NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess, NetworkConnectivityLevelHintInternetAccess,
@@ -29,7 +28,6 @@ use windows::Win32::Networking::WinSock::{
 use windows::Win32::System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::core::{PCWSTR, Result, implement};
-use windows::Win32::Foundation::PROPERTYKEY;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Volume {

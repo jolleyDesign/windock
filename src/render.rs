@@ -178,17 +178,7 @@ fn d3d_device(gpu: bool) -> Result<ID3D11Device> {
     for &driver in drivers {
         let mut device = None;
         let r = unsafe {
-            D3D11CreateDevice(
-                None::<&IDXGIAdapter>,
-                driver,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
+            D3D11CreateDevice(None::<&IDXGIAdapter>, driver, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, None)
         };
         match (r, device) {
             (Ok(()), Some(d)) => return Ok(d),
@@ -247,11 +237,8 @@ impl Gpu {
             let (island_backdrop, island_shape) = frosted()?;
 
             let (w, h) = (width.max(1), height.max(1));
-            let surface = self.graphics.CreateDrawingSurface(
-                Size { Width: w as f32, Height: h as f32 },
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                DirectXAlphaMode::Premultiplied,
-            )?;
+            let surface =
+                self.graphics.CreateDrawingSurface(Size { Width: w as f32, Height: h as f32 }, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied)?;
             let content = c.CreateSpriteVisual()?;
             content.SetBrush(&c.CreateSurfaceBrushWithSurface(&surface)?)?;
             content.SetSize(Vector2 { X: w as f32, Y: h as f32 })?;
@@ -276,15 +263,7 @@ impl Gpu {
         self.layouts.clear();
         self.label_format = unsafe {
             self.dwrite
-                .CreateTextFormat(
-                    &HSTRING::from(family),
-                    None,
-                    DWRITE_FONT_WEIGHT_MEDIUM,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    size_px,
-                    w!(""),
-                )
+                .CreateTextFormat(&HSTRING::from(family), None, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size_px, w!(""))
                 .inspect(|f| {
                     let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                     if let Ok(ellipsis) = self.dwrite.CreateEllipsisTrimmingSign(f) {
@@ -380,16 +359,7 @@ impl Gpu {
             bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
             colorContext: std::mem::ManuallyDrop::new(None),
         };
-        let bmp = unsafe {
-            self.resources
-                .CreateBitmap(
-                    D2D_SIZE_U { width: px.width, height: px.height },
-                    Some(px.data.as_ptr() as _),
-                    px.width * 4,
-                    &props,
-                )
-                .ok()?
-        };
+        let bmp = unsafe { self.resources.CreateBitmap(D2D_SIZE_U { width: px.width, height: px.height }, Some(px.data.as_ptr() as _), px.width * 4, &props).ok()? };
         self.bitmaps.insert(source.to_string(), bmp.clone());
         Some(bmp)
     }
@@ -461,14 +431,7 @@ impl Gpu {
         }
     }
 
-    fn paint(
-        &self,
-        dc: &ID2D1DeviceContext,
-        f: &Frame,
-        p: &Prepared,
-        at: POINT,
-        update: RECT,
-    ) {
+    fn paint(&self, dc: &ID2D1DeviceContext, f: &Frame, p: &Prepared, at: POINT, update: RECT) {
         unsafe {
             dc.SetDpi(96.0, 96.0);
             // `at` is where the update rectangle's top-left lives in the (possibly shared) surface.
@@ -490,14 +453,7 @@ impl Gpu {
             }
             for (icon, bmp) in f.icons.iter().zip(&p.bitmaps) {
                 match bmp {
-                    Some(b) => dc.DrawBitmap(
-                        b,
-                        Some(&icon.rect.d2d()),
-                        icon.opacity,
-                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                        None,
-                        None,
-                    ),
+                    Some(b) => dc.DrawBitmap(b, Some(&icon.rect.d2d()), icon.opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
                     None => self.fill(dc, icon.rect.inflate(-icon.rect.w() * 0.08), icon.rect.w() * 0.22, f.placeholder.alpha(icon.opacity * 0.7)),
                 }
             }

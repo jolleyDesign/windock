@@ -1,21 +1,21 @@
 //! Finding taskbar-worthy windows and working out which app each belongs to.
 
 use crate::util::from_wide;
+use std::collections::HashMap;
+use std::path::Path;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
-use std::collections::HashMap;
-use std::path::Path;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::core::{BOOL, GUID, PWSTR};
 
 /// Identifies an app. Windows match pinned items by AppUserModelID first, then by executable.
@@ -33,9 +33,10 @@ pub struct AppKey {
 impl AppKey {
     pub fn matches(&self, other: &AppKey) -> bool {
         if let (Some(a), Some(b)) = (&self.aumid, &other.aumid)
-            && a.eq_ignore_ascii_case(b) {
-                return true;
-            }
+            && a.eq_ignore_ascii_case(b)
+        {
+            return true;
+        }
         if let (Some(a), Some(b)) = (&self.exe, &other.exe) {
             // Two different explicit IDs on the same exe (e.g. browser profiles) are different apps.
             return a.eq_ignore_ascii_case(b) && (self.aumid.is_none() || other.aumid.is_none());
@@ -51,9 +52,7 @@ impl AppKey {
         let (Some(exe), Some(window_exe)) = (&self.exe, &window.exe) else { return false };
         let Some(dir) = std::path::Path::new(exe).parent() else { return false };
         let dir = format!("{}\\", dir.to_string_lossy().to_lowercase());
-        window.aumid.is_some()
-            && window.ancestors.iter().any(|a| a.eq_ignore_ascii_case(exe))
-            && window_exe.to_lowercase().starts_with(&dir)
+        window.aumid.is_some() && window.ancestors.iter().any(|a| a.eq_ignore_ascii_case(exe)) && window_exe.to_lowercase().starts_with(&dir)
     }
 
     pub fn group_id(&self) -> String {
@@ -82,18 +81,13 @@ pub fn pid_of(hwnd: HWND) -> u32 {
 
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
-    unsafe {
-        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as _, 4).is_ok() && cloaked != 0
-    }
+    unsafe { DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as _, 4).is_ok() && cloaked != 0 }
 }
 
 /// Windows on other virtual desktops are cloaked by the shell; tell those apart from
 /// windows that are cloaked for other reasons (e.g. suspended Store apps).
 fn on_other_desktop(desktops: &IVirtualDesktopManager, hwnd: HWND) -> bool {
-    unsafe {
-        desktops.IsWindowOnCurrentVirtualDesktop(hwnd).is_ok_and(|here| !here.as_bool())
-            && desktops.GetWindowDesktopId(hwnd).is_ok_and(|id| id != GUID::zeroed())
-    }
+    unsafe { desktops.IsWindowOnCurrentVirtualDesktop(hwnd).is_ok_and(|here| !here.as_bool()) && desktops.GetWindowDesktopId(hwnd).is_ok_and(|id| id != GUID::zeroed()) }
 }
 
 /// Roughly the same rules the taskbar and Alt+Tab use. With `desktops`, windows on other
@@ -119,10 +113,7 @@ pub fn is_app_window(hwnd: HWND, own_pid: u32, desktops: Option<&IVirtualDesktop
         if is_cloaked(hwnd) && !desktops.is_some_and(|d| on_other_desktop(d, hwnd)) {
             return false;
         }
-        !matches!(
-            class_name(hwnd).as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow"
-        )
+        !matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow")
     }
 }
 
@@ -137,9 +128,7 @@ pub fn app_windows(own_pid: u32, all_desktops: bool) -> Vec<HWND> {
     unsafe {
         let _ = EnumWindows(Some(cb), LPARAM(&mut all as *mut _ as isize));
     }
-    let desktops: Option<IVirtualDesktopManager> = all_desktops
-        .then(|| unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_INPROC_SERVER) }.ok())
-        .flatten();
+    let desktops: Option<IVirtualDesktopManager> = all_desktops.then(|| unsafe { CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_INPROC_SERVER) }.ok()).flatten();
     all.retain(|&h| is_app_window(h, own_pid, desktops.as_ref()));
     all
 }
@@ -209,16 +198,12 @@ pub fn window_key(hwnd: HWND) -> AppKey {
     let mut pid = pid_of(hwnd);
     let explicit = window_aumid(hwnd);
     if class_name(hwnd) == "ApplicationFrameWindow"
-        && let Some(p) = hosted_app_pid(hwnd) {
-            pid = p;
-        }
-    let pkg = package_aumid(pid);
-    AppKey {
-        packaged: pkg.is_some(),
-        aumid: explicit.or(pkg),
-        exe: process_path(pid),
-        ancestors: ancestor_exes(pid),
+        && let Some(p) = hosted_app_pid(hwnd)
+    {
+        pid = p;
     }
+    let pkg = package_aumid(pid);
+    AppKey { packaged: pkg.is_some(), aumid: explicit.or(pkg), exe: process_path(pid), ancestors: ancestor_exes(pid) }
 }
 
 /// Up to three generations of parent processes, stopping at Windows' own processes
@@ -262,12 +247,7 @@ pub fn activate(hwnd: HWND) {
         if !SetForegroundWindow(hwnd).as_bool() {
             // Windows only lets the process that received the last input steal focus;
             // a synthetic Alt tap satisfies that rule.
-            let alt = |flags| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT { wVk: VK_MENU, dwFlags: flags, ..Default::default() },
-                },
-            };
+            let alt = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_MENU, dwFlags: flags, ..Default::default() } } };
             SendInput(&[alt(KEYBD_EVENT_FLAGS(0)), alt(KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
             let _ = SetForegroundWindow(hwnd);
         }
@@ -310,12 +290,7 @@ mod tests {
     use super::*;
 
     fn key(aumid: Option<&str>, exe: &str, ancestors: &[&str]) -> AppKey {
-        AppKey {
-            aumid: aumid.map(str::to_string),
-            exe: Some(exe.to_string()),
-            packaged: false,
-            ancestors: ancestors.iter().map(|s| s.to_string()).collect(),
-        }
+        AppKey { aumid: aumid.map(str::to_string), exe: Some(exe.to_string()), packaged: false, ancestors: ancestors.iter().map(|s| s.to_string()).collect() }
     }
 
     const STEAM: &str = r"C:\Program Files (x86)\Steam\steam.exe";

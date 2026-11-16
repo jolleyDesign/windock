@@ -16,9 +16,7 @@ pub fn from_wide(buf: &[u16]) -> String {
 
 /// %APPDATA%\Windock
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("Windock")
 }
 
@@ -27,10 +25,7 @@ pub fn log_path() -> PathBuf {
 }
 
 pub fn log(msg: &str) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let _ = std::fs::create_dir_all(data_dir());
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
         let _ = writeln!(f, "[{secs}] {msg}");

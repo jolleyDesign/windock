@@ -115,14 +115,7 @@ impl<A: App> ApplicationHandler for Host<A> {
                 return;
             }
         };
-        let state = egui_winit::State::new(
-            self.ctx.clone(),
-            ViewportId::ROOT,
-            event_loop,
-            Some(window.scale_factor() as f32),
-            window.theme(),
-            Some(MAX_TEXTURE_SIDE),
-        );
+        let state = egui_winit::State::new(self.ctx.clone(), ViewportId::ROOT, event_loop, Some(window.scale_factor() as f32), window.theme(), Some(MAX_TEXTURE_SIDE));
         egui_winit::update_viewport_info(&mut self.info, &self.ctx, &window, true);
         if let Some(mhz) = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0) {
             self.frame_interval = Duration::from_secs(1000) / mhz;
@@ -175,20 +168,7 @@ fn present(window: &Window, raster: &Raster) {
     };
     unsafe {
         let dc = GetDC(Some(hwnd));
-        SetDIBitsToDevice(
-            dc,
-            0,
-            0,
-            raster.width as u32,
-            raster.height as u32,
-            0,
-            0,
-            0,
-            raster.height as u32,
-            raster.pixels.as_ptr().cast(),
-            &info,
-            DIB_RGB_COLORS,
-        );
+        SetDIBitsToDevice(dc, 0, 0, raster.width as u32, raster.height as u32, 0, 0, 0, raster.height as u32, raster.pixels.as_ptr().cast(), &info, DIB_RGB_COLORS);
         ReleaseDC(Some(hwnd), dc);
     }
 }

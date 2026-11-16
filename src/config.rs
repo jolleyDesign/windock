@@ -11,12 +11,7 @@ pub struct Color {
 
 impl Color {
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self {
-            r: r as f32 / 255.0,
-            g: g as f32 / 255.0,
-            b: b as f32 / 255.0,
-            a: a as f32 / 255.0,
-        }
+        Self { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: a as f32 / 255.0 }
     }
 
     /// Parses `#RRGGBB` or `#RRGGBBAA`.
@@ -53,9 +48,7 @@ impl Serialize for Color {
 impl<'de> Deserialize<'de> for Color {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Color::parse(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!("invalid color {s:?}, expected \"#RRGGBB\" or \"#RRGGBBAA\""))
-        })
+        Color::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("invalid color {s:?}, expected \"#RRGGBB\" or \"#RRGGBBAA\"")))
     }
 }
 
@@ -548,10 +541,7 @@ pub fn save_pinned(path: &Path, pinned: &[Pinned]) -> Result<String, String> {
 /// Writes every setting, editing values in place so comments, layout and unknown keys survive.
 pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
     let mut doc = read_document(path)?;
-    let fresh = toml::to_string(cfg)
-        .map_err(|e| e.to_string())?
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
+    let fresh = toml::to_string(cfg).map_err(|e| e.to_string())?.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
     for section in ["dock", "appearance", "magnification", "animation", "shortcuts", "clock", "tray"] {
         let Some(values) = fresh.get(section).and_then(|i| i.as_table()) else { continue };
         if !doc.contains_table(section) {
@@ -574,19 +564,8 @@ pub fn save(path: &Path, cfg: &Config) -> Result<String, String> {
     write_document(path, &doc)
 }
 
-const OPTIONAL_KEYS: [&str; 11] = [
-    "padding",
-    "padding_x",
-    "padding_y",
-    "background",
-    "border",
-    "indicator_color",
-    "active_indicator_color",
-    "attention_color",
-    "label_background",
-    "label_text",
-    "color",
-];
+const OPTIONAL_KEYS: [&str; 11] =
+    ["padding", "padding_x", "padding_y", "background", "border", "indicator_color", "active_indicator_color", "attention_color", "label_background", "label_text", "color"];
 
 fn read_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|_| default_text());
@@ -659,10 +638,7 @@ fn default_pins() -> Vec<(String, &'static str)> {
     let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let mut pins = vec![(format!(r"{windir}\explorer.exe"), "File Explorer")];
-    for edge in [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ] {
+    for edge in [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"] {
         if Path::new(edge).exists() {
             pins.push((edge.into(), "Microsoft Edge"));
             break;
@@ -677,10 +653,7 @@ fn default_pins() -> Vec<(String, &'static str)> {
     } else {
         pins.push((format!(r"{windir}\System32\notepad.exe"), "Notepad"));
     }
-    pins.push((
-        r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".into(),
-        "Settings",
-    ));
+    pins.push((r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".into(), "Settings"));
     pins
 }
 
@@ -788,9 +761,7 @@ mod tests {
 
     #[test]
     fn placement_decides_whether_clock_and_status_show() {
-        let cfg = |placement: &str, hide_taskbar: bool| {
-            parse(&format!("[dock]\nhide_taskbar = {hide_taskbar}\n[tray]\nplacement = \"{placement}\"\n")).unwrap()
-        };
+        let cfg = |placement: &str, hide_taskbar: bool| parse(&format!("[dock]\nhide_taskbar = {hide_taskbar}\n[tray]\nplacement = \"{placement}\"\n")).unwrap();
         assert_eq!(cfg("corner", true).tray.placement, Placement::Corner);
         assert!(cfg("corner", true).shows_clock() && cfg("corner", true).shows_status());
         assert!(cfg("dock", true).shows_clock());

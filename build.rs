@@ -38,15 +38,7 @@ fn compile(rc: &Path, res: &Path) -> bool {
     tools.push(llvm("llvm-rc".into()));
     tools.extend((14..=22).rev().map(|v| llvm(format!("llvm-rc-{v}"))));
     tools.push(("rc.exe".into(), vec![]));
-    tools.into_iter().any(|(tool, extra)| {
-        Command::new(&tool)
-            .args(&extra)
-            .arg("/fo")
-            .arg(res)
-            .arg(rc)
-            .status()
-            .is_ok_and(|s| s.success())
-    })
+    tools.into_iter().any(|(tool, extra)| Command::new(&tool).args(&extra).arg("/fo").arg(res).arg(rc).status().is_ok_and(|s| s.success()))
 }
 
 /// An .ico with uncompressed 32-bit images at each size.

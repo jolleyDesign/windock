@@ -4,9 +4,7 @@
 use crate::config::{Clock, DateStyle};
 use std::time::Duration;
 use windows::Win32::Foundation::SYSTEMTIME;
-use windows::Win32::Globalization::{
-    DATE_LONGDATE, DATE_SHORTDATE, ENUM_DATE_FORMATS_FLAGS, GetDateFormatEx, GetTimeFormatEx, TIME_FORMAT_FLAGS, TIME_NOSECONDS,
-};
+use windows::Win32::Globalization::{DATE_LONGDATE, DATE_SHORTDATE, ENUM_DATE_FORMATS_FLAGS, GetDateFormatEx, GetTimeFormatEx, TIME_FORMAT_FLAGS, TIME_NOSECONDS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::{HSTRING, PCWSTR};
 
@@ -38,11 +36,7 @@ pub fn face(cfg: &Clock, t: &SYSTEMTIME) -> Face {
     };
     let tooltip = format_date(t, DATE_LONGDATE, None).unwrap_or_default();
     let ms_into_second = t.wMilliseconds as u64;
-    let next_change = if seconds {
-        Duration::from_millis(1000 - ms_into_second)
-    } else {
-        Duration::from_millis((60 - t.wSecond as u64) * 1000 - ms_into_second)
-    };
+    let next_change = if seconds { Duration::from_millis(1000 - ms_into_second) } else { Duration::from_millis((60 - t.wSecond as u64) * 1000 - ms_into_second) };
     Face { time, date, tooltip, next_change }
 }
 
@@ -69,25 +63,14 @@ fn to_string(buf: &[u16], n: i32) -> Option<String> {
 fn format_time(t: &SYSTEMTIME, flags: TIME_FORMAT_FLAGS, pattern: Option<&str>) -> Option<String> {
     let pattern = pattern.map(HSTRING::from);
     let mut buf = [0u16; 128];
-    let n = unsafe {
-        GetTimeFormatEx(PCWSTR::null(), flags, Some(t), pattern.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())), Some(&mut buf))
-    };
+    let n = unsafe { GetTimeFormatEx(PCWSTR::null(), flags, Some(t), pattern.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())), Some(&mut buf)) };
     to_string(&buf, n)
 }
 
 fn format_date(t: &SYSTEMTIME, flags: ENUM_DATE_FORMATS_FLAGS, pattern: Option<&str>) -> Option<String> {
     let pattern = pattern.map(HSTRING::from);
     let mut buf = [0u16; 128];
-    let n = unsafe {
-        GetDateFormatEx(
-            PCWSTR::null(),
-            flags,
-            Some(t),
-            pattern.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
-            Some(&mut buf),
-            PCWSTR::null(),
-        )
-    };
+    let n = unsafe { GetDateFormatEx(PCWSTR::null(), flags, Some(t), pattern.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())), Some(&mut buf), PCWSTR::null()) };
     to_string(&buf, n)
 }
 

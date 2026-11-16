@@ -4,8 +4,8 @@
 use super::*;
 use crate::render::Surface;
 use windows::Win32::Graphics::Dwm::{
-    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
-    DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+    DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
 
 pub(super) const TIMER_PREVIEW: usize = 5;
@@ -42,17 +42,7 @@ pub(super) struct Preview {
 
 impl Preview {
     pub(super) fn new(hwnd: HWND) -> Self {
-        Self {
-            hwnd,
-            surface: None,
-            item: None,
-            pending: None,
-            icon: String::new(),
-            cards: Vec::new(),
-            size: (0.0, 0.0),
-            hover: None,
-            tracking: false,
-        }
+        Self { hwnd, surface: None, item: None, pending: None, icon: String::new(), cards: Vec::new(), size: (0.0, 0.0), hover: None, tracking: false }
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -226,10 +216,7 @@ impl App {
         let mut sources = Vec::new();
         for &w in &windows {
             let Ok(thumb) = (unsafe { DwmRegisterThumbnail(self.preview.hwnd, HWND(w as _)) }) else { continue };
-            let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }
-                .ok()
-                .filter(|s| s.cx > 0 && s.cy > 0)
-                .map_or((16.0, 9.0), |s| (s.cx as f32, s.cy as f32));
+            let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().filter(|s| s.cx > 0 && s.cy > 0).map_or((16.0, 9.0), |s| (s.cx as f32, s.cy as f32));
             sources.push((w, thumb, size));
         }
 
@@ -245,10 +232,7 @@ impl App {
                     (sw * k, sh * k)
                 })
                 .collect();
-            let card_main: Vec<f32> = shots
-                .iter()
-                .map(|&(w, h)| if horizontal { w.max(150.0 * s * scale) + 2.0 * inner } else { row + 6.0 * s + h + 2.0 * inner })
-                .collect();
+            let card_main: Vec<f32> = shots.iter().map(|&(w, h)| if horizontal { w.max(150.0 * s * scale) + 2.0 * inner } else { row + 6.0 * s + h + 2.0 * inner }).collect();
             total = card_main.iter().sum::<f32>() + gap * card_main.len().saturating_sub(1) as f32 + 2.0 * pad;
             if total <= available || scale < 0.35 {
                 break;
@@ -261,11 +245,7 @@ impl App {
         let mut cards = Vec::new();
         let mut at = pad;
         for (&(hwnd, thumb, _), &(tw, th)) in sources.iter().zip(&shots) {
-            let (w, h) = if horizontal {
-                (tw.max(150.0 * s * scale) + 2.0 * inner, row + 6.0 * s + shot_h + 2.0 * inner)
-            } else {
-                (card_w, row + 6.0 * s + th + 2.0 * inner)
-            };
+            let (w, h) = if horizontal { (tw.max(150.0 * s * scale) + 2.0 * inner, row + 6.0 * s + shot_h + 2.0 * inner) } else { (card_w, row + 6.0 * s + th + 2.0 * inner) };
             let rect = if horizontal { RectF::new(at, pad, w, h) } else { RectF::new(pad, at, w, h) };
             at += if horizontal { w } else { h } + gap;
             let icon_size = (16.0 * s).round();
@@ -374,9 +354,10 @@ impl App {
             labels,
         };
         if let (Some(g), Some(sf)) = (&mut self.gpu, &mut self.preview.surface)
-            && let Err(e) = g.draw(sf, &frame, &self.icons) {
-                crate::log!("preview draw failed: {e}");
-            }
+            && let Err(e) = g.draw(sf, &frame, &self.icons)
+        {
+            crate::log!("preview draw failed: {e}");
+        }
     }
 
     pub(super) fn preview_message(&mut self, msg: u32, lp: LPARAM) -> Option<LRESULT> {
@@ -385,12 +366,7 @@ impl App {
         match msg {
             WM_MOUSEMOVE => {
                 if !self.preview.tracking {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: self.preview.hwnd,
-                        dwHoverTime: 0,
-                    };
+                    let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.preview.hwnd, dwHoverTime: 0 };
                     unsafe {
                         let _ = TrackMouseEvent(&mut tme);
                     }

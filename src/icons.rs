@@ -76,9 +76,7 @@ impl IconLoader {
 fn load(source: &str, size: u32) -> Option<IconPixels> {
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(source), None).ok()?;
-        let hbm = factory
-            .GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
-            .ok()?;
+        let hbm = factory.GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
         let px = bitmap_pixels(hbm);
         let _ = DeleteObject(hbm.into());
         px.map(trim)
