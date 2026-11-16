@@ -7,7 +7,7 @@ mod preview;
 
 use crate::apps::{self, AppKey};
 use crate::clock;
-use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position, TrayApps};
+use crate::config::{self, Color, Config, IndicatorStyle, MonitorSel, Palette, Pinned, Placement, Position, Show, TrayApps};
 use crate::icons::{IconLoader, IconPixels};
 use crate::render::{Font, Frame, Gpu, IconDraw, LabelDraw, RectF, Shape, Surface, TextDraw};
 use crate::hotkeys;
@@ -669,6 +669,13 @@ impl App {
 
     fn save_pins(&mut self) {
         match config::save_pinned(&self.cfg_path, &self.cfg.pinned) {
+            Ok(text) => self.cfg_text = text,
+            Err(e) => self.show_notice(format!("Couldn't save config: {e}"), NOTICE_TIME),
+        }
+    }
+
+    fn save_config(&mut self) {
+        match config::save(&self.cfg_path, &self.cfg) {
             Ok(text) => self.cfg_text = text,
             Err(e) => self.show_notice(format!("Couldn't save config: {e}"), NOTICE_TIME),
         }
@@ -1487,7 +1494,8 @@ impl App {
                 continue;
             }
             if it.kind == Kind::Start {
-                if let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
+                if drag_id != Some(it.id.as_str())
+                    && let Some((u0, u1, v0, v1)) = self.icon_uv(i) {
                     let rect = ax.rect(u0, u1, v0, v1);
                     region.push(rect);
                     windows_logo(&mut shapes, rect, pal.start.alpha(it.appear));
@@ -1533,7 +1541,12 @@ impl App {
             && let Some(it) = self.items.iter().find(|it| it.id == d.id) {
                 let size = m.icon * if d.removing { 1.0 } else { it.mag };
                 let rect = RectF { l: x - size / 2.0, t: y - size / 2.0, r: x + size / 2.0, b: y + size / 2.0 };
-                icons.push(IconDraw { rect, source: &it.icon, opacity: if d.removing { 0.5 } else { 0.92 } });
+                let opacity = if d.removing { 0.5 } else { 0.92 };
+                if it.kind == Kind::Start {
+                    windows_logo(&mut shapes, rect, pal.start.alpha(opacity));
+                } else {
+                    icons.push(IconDraw { rect, source: &it.icon, opacity });
+                }
             }
 
         let frame = Frame {
@@ -1744,8 +1757,9 @@ impl App {
         if let Some(p) = &self.press {
             let moved = (x - p.x).hypot(y - p.y) > 6.0 * self.m.s;
             if self.drag.is_none() && moved {
-                let pinned = p.id.as_ref().and_then(|id| self.items.iter().find(|it| &it.id == id && matches!(it.kind, Kind::Pinned(_))));
-                if let Some(it) = pinned {
+                // The Start button can't move, but dragging it off the dock removes it too.
+                let movable = p.id.as_ref().and_then(|id| self.items.iter().find(|it| &it.id == id && matches!(it.kind, Kind::Pinned(_) | Kind::Start)));
+                if let Some(it) = movable {
                     self.drag = Some(Drag { id: it.id.clone(), original: self.cfg.pinned.clone(), removing: false });
                 }
             }
@@ -1993,6 +2007,10 @@ impl App {
 
     fn finish_drag(&mut self) {
         let Some(d) = self.drag.take() else { return };
+        if d.removing && self.items.iter().any(|it| it.id == d.id && it.kind == Kind::Start) {
+            self.cfg.dock.start_button = Show::Never;
+            self.save_config();
+        }
         if d.removing
             && let Some(i) = self.pinned_index(&d.id) {
                 self.cfg.pinned.remove(i);
@@ -2430,9 +2448,9 @@ fn double_click_time() -> Duration {
     Duration::from_millis(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as u64)
 }
 
-/// The Windows logo, four squares, centred in `rect` at about the taskbar's proportions.
+/// The Windows logo, four squares, centred in `rect` and about as big as an app icon's artwork.
 fn windows_logo(shapes: &mut Vec<Shape>, rect: RectF, color: Color) {
-    let size = rect.w().min(rect.h()) * 0.56;
+    let size = rect.w().min(rect.h()) * 0.8;
     let gap = size * 0.06;
     let pane = (size - gap) / 2.0;
     let (l, t) = ((rect.l + rect.r - size) / 2.0, (rect.t + rect.b - size) / 2.0);

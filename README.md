@@ -29,7 +29,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Right-click an app | Pick a window (when there are several), Open / New window, Keep in dock / Remove from dock, and last, Close window(s) |
 | Right-click the dock between or beside the apps | Show desktop, Import taskbar pins, Dock settings…, Quit Windock (also under the clock's and status icons' entries) |
 | Drag an icon along the dock | Reorder pinned apps |
-| Drag an icon off the dock and release | Unpin it |
+| Drag an icon off the dock and release | Unpin it (the Start button: hide it, as `start_button = "never"` does) |
 | Drop files onto an app | Open them with that app |
 | Drop files, shortcuts or folders between apps | Pin them at that position (programs and shortcuts always pin) |
 | Click the clock | Notifications and calendar (right-click: Adjust date and time) |
