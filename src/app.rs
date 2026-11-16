@@ -2316,6 +2316,7 @@ impl App {
                 let h = wp.0 as isize;
                 self.fg = h;
                 self.attention.remove(&h);
+                self.flyout_foreground(HWND(h as _));
                 if !self.windows.iter().any(|(w, _)| *w == h) {
                     self.set_timer(TIMER_REFRESH, 60);
                 }

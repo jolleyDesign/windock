@@ -23,11 +23,14 @@ pub(super) struct Flyout {
     hover: Option<usize>,
     tracking: bool,
     region: Vec<RECT>,
+    /// The process whose menu a right-click opened. The flyout stays open while the focus is
+    /// with it, like the taskbar's.
+    lent: Option<u32>,
 }
 
 impl Flyout {
     pub(super) fn new(hwnd: HWND) -> Self {
-        Self { hwnd, surface: None, open: false, cells: Vec::new(), size: (0.0, 0.0), grid: RectF::default(), hover: None, tracking: false, region: Vec::new() }
+        Self { hwnd, surface: None, open: false, cells: Vec::new(), size: (0.0, 0.0), grid: RectF::default(), hover: None, tracking: false, region: Vec::new(), lent: None }
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -85,6 +88,7 @@ impl App {
 
     pub(super) fn open_flyout(&mut self) {
         self.close_preview();
+        let was_open = self.flyout.open;
         self.flyout.open = true;
         self.flyout.hover = None;
         self.layout_flyout();
@@ -94,8 +98,11 @@ impl App {
         }
         self.position_flyout();
         self.draw_flyout();
-        unsafe {
-            let _ = SetForegroundWindow(self.flyout.hwnd);
+        // Refreshing an open flyout mustn't take the focus back from an app's menu.
+        if !was_open {
+            unsafe {
+                let _ = SetForegroundWindow(self.flyout.hwnd);
+            }
         }
         self.dirty = true;
     }
@@ -107,6 +114,7 @@ impl App {
         self.flyout.open = false;
         self.flyout.hover = None;
         self.flyout.tracking = false;
+        self.flyout.lent = None;
         unsafe {
             let _ = ShowWindow(self.flyout.hwnd, SW_HIDE);
         }
@@ -249,10 +257,26 @@ impl App {
     fn flyout_click(&mut self, right: bool) {
         let Some(id) = self.flyout.hover.and_then(|k| self.flyout.cells.get(k)).map(|c| c.id.clone()) else { return };
         // Click first, while the flyout still has the focus to hand on to the app.
-        if let Some(icon) = self.tray_icon(&id) {
-            tray::click(icon, if right { tray::Click::Right } else { tray::Click::Left }, cursor_pos());
+        let Some(icon) = self.tray_icon(&id) else { return };
+        tray::click(icon, if right { tray::Click::Right } else { tray::Click::Left }, cursor_pos());
+        let pid = apps::pid_of(HWND(icon.owner as _));
+        // A right click opens the app's menu over the flyout, which stays open; a left click
+        // usually opens the app, so it closes.
+        if right {
+            self.flyout.lent = Some(pid);
+        } else {
+            self.close_flyout();
         }
-        self.close_flyout();
+    }
+
+    /// Another app took the focus. While an app's menu is open from the flyout, the menu (or
+    /// the hidden window the app brings forward for it) keeps the flyout open; one of the app's
+    /// windows opening, or any other app, closes it.
+    pub(super) fn flyout_foreground(&mut self, hwnd: HWND) {
+        let Some(pid) = self.flyout.lent else { return };
+        if apps::pid_of(hwnd) != pid || apps::is_app_window(hwnd, self.own_pid, None) {
+            self.close_flyout();
+        }
     }
 
     pub(super) fn flyout_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -284,8 +308,15 @@ impl App {
             WM_LBUTTONUP => self.flyout_click(false),
             WM_RBUTTONUP => self.flyout_click(true),
             WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => self.close_flyout(),
-            // Clicking anywhere else, or switching apps, closes it.
-            WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => self.close_flyout(),
+            // Clicking anywhere else, or switching apps, closes it, unless the focus went to the
+            // menu of an icon in it; flyout_foreground watches where it goes from there.
+            WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => {
+                if self.flyout.lent.is_none() {
+                    self.close_flyout();
+                }
+            }
+            // Clicked again after an app's menu: it has the focus back.
+            WM_ACTIVATE => self.flyout.lent = None,
             WM_ERASEBKGND => return Some(LRESULT(1)),
             WM_PAINT => unsafe {
                 let _ = ValidateRect(Some(self.flyout.hwnd), None);
