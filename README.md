@@ -1,6 +1,13 @@
 # Windock
 
-A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME's dash.
+[![CI](https://github.com/jolleyDesign/windock/actions/workflows/ci.yml/badge.svg)](https://github.com/jolleyDesign/windock/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/jolley)
+
+A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME's dash. Use it
+beside the taskbar, or hide the taskbar and let Windock replace it.
+
+![Windock with the taskbar hidden: pinned and running apps, other apps' tray icons, and the clock](docs/dock.png)
 
 - Pinned apps plus running apps, with indicators for open windows, the focused app and apps asking for attention
 - Live window previews on hover, like the Windows taskbar
@@ -14,8 +21,25 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 - A Start button and a Show desktop button, also shown automatically when the taskbar is hidden
 - Drag icons to reorder, drag an icon off to remove it; drop files onto an app to open them with it, or between apps to pin them
 - Keyboard shortcuts for pinned apps and for showing the dock
-- Hot-reloaded TOML config
-- Native Rust + Win32: uses no CPU when idle, ~25 MB RAM, one ~700 KB `.exe`, no runtime to install
+- A settings window, or a hot-reloaded TOML file if you prefer editing text
+- Native Rust + Win32: uses no CPU when idle, ~30 MB of memory, one ~6 MB `.exe`, no runtime to install
+
+## Installing
+
+Windock runs on 64-bit Windows 10 and 11. Download `windock.exe` from the
+[latest release](https://github.com/jolleyDesign/windock/releases/latest) (or
+[build it from source](#building)), put it wherever you like, and run it. It keeps no state next to
+the `.exe`, and needs no installer or admin rights.
+
+The `.exe` isn't code-signed yet, so the first time you run it, Windows SmartScreen may say it
+"protected your PC". Choose **More info** → **Run anyway**. Each release lists SHA-256 checksums if
+you'd like to check your download.
+
+- **Start at sign-in:** turn on *Start at sign-in* in the settings window (or `autostart = true`).
+- **Quit:** right-click the dock beside the apps → **Quit Windock**. If it hid the taskbar, the
+  taskbar comes back.
+- **Uninstall:** turn off *Start at sign-in*, quit, then delete `windock.exe` and
+  `%APPDATA%\Windock` (settings, log and copied taskbar shortcuts).
 
 ## Using it
 
@@ -27,7 +51,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Middle-click | Open a new window / instance |
 | Hover a running app | Live previews of its windows: click one to switch to it, **✕** or middle-click to close it |
 | Right-click an app | Pick a window (when there are several), Open / New window, Keep in dock / Remove from dock, and last, Close window(s) |
-| Right-click the dock between or beside the apps | Show desktop, Import taskbar pins, Dock settings…, Quit Windock (also under the clock's and status icons' entries) |
+| Right-click the dock between or beside the apps | Show desktop, Import taskbar pins, Dock settings… (the settings window), Quit Windock (also under the clock's and status icons' entries) |
 | Drag an icon along the dock | Reorder pinned apps |
 | Drag an icon off the dock and release | Unpin it (the Start button: hide it, as `start_button = "never"` does) |
 | Drop files onto an app | Open them with that app |
@@ -36,7 +60,7 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 | Click the network/volume icons | Quick Settings, opened above them when they're in a bottom or side dock (right-click: sound, mixer, network and power settings) |
 | Scroll over them / middle-click | Change the volume / mute |
 | Click / right-click another app's tray icon | What it does on the taskbar: usually open the app / its menu |
-| Click the arrow beside them | A grid of the tray icons Windows keeps off the taskbar; click or right-click them as usual |
+| Click the arrow beside them | A grid of the tray icons Windows keeps off the taskbar; click or right-click them as usual (it stays open while an icon's menu is up) |
 | Click the Start button | Open (or close) the Start menu; right-click for the Win+X menu |
 | Click Show desktop | Minimize every window; click again to bring them back |
 | Ctrl+Alt+1–9 (0 for the 10th) | Open or switch to that pinned app, like clicking it |
@@ -44,17 +68,22 @@ A clean, fast dock for Windows 10/11, in the spirit of the macOS Dock and GNOME'
 
 ## Configuration
 
-`%APPDATA%\Windock\config.toml` is created on first run with every option commented. Right-click
-the dock beside the apps (or the clock) → **Dock settings…** opens it. Changes apply as soon as you save. If the file has an
-error, the dock shows it and keeps the last good settings.
+Right-click the dock beside the apps (or the clock) → **Dock settings…** opens the settings window
+(also `windock.exe --settings`). Every change shows up in the dock as you make it.
+
+Behind it is `%APPDATA%\Windock\config.toml`, created on first run with every option commented.
+You can edit it directly instead: changes apply as soon as you save, and if the file has an error,
+the dock shows it and keeps the last good settings. The main options:
 
 ```toml
 [dock]
 position = "bottom"      # bottom | top | left | right
 monitor = "primary"      # or 0, 1, ...
 autohide = false
+autohide_delay_ms = 400
 reserve_space = false    # keep maximized windows from covering the dock
 hide_taskbar = false     # hide the Windows taskbar, clock and tray icons included
+always_on_top = true
 show_running = true
 show_all_desktops = false
 show_labels = true
@@ -76,6 +105,8 @@ edge_margin = 8
 corner_radius = 18
 blur = true
 indicator = "dot"        # dot | line | none
+label_font = "Segoe UI Variable Text"
+label_size = 13
 # background = "#1c1c1e8c" (and border, indicator_color, active_indicator_color,
 # attention_color, label_background, label_text): "#RRGGBB" or "#RRGGBBAA"
 
@@ -121,6 +152,14 @@ To find a Store app's ID, run `Get-StartApps` in PowerShell.
 
 The log is at `%APPDATA%\Windock\windock.log`.
 
+## Known limitations
+
+- Apps that ignore `TaskbarCreated` (OneDrive does) only show their tray icon once they next update
+  it, or after a restart of the app.
+- Balloon notifications from tray icons are left to Windows.
+- No jump lists, progress bars or unread badges yet, and one dock on one monitor.
+  [PLAN.md](PLAN.md) has the roadmap.
+
 ## Building
 
 The build cross-compiles from WSL (or Linux) using [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin):
@@ -132,7 +171,13 @@ scripts/deploy.sh          # build, install to %LOCALAPPDATA%\Programs\Windock, 
 scripts/deploy.sh --stop   # stop the running dock
 ```
 
-On Windows itself, `cargo build --release` works with the MSVC toolchain.
+On Windows itself, `cargo build --release` works with the MSVC toolchain, and
+`cargo run --release` starts the dock straight from the build.
+
+Run the tests in release mode (`cargo test --release` on Windows): in debug builds, three of the
+settings window's raster tests trip a debug assertion inside egui. From WSL, `cargo xwin test` tries to
+run them under Wine, so build with `--no-run` and run the printed `.exe` on Windows.
+[CONTRIBUTING.md](CONTRIBUTING.md) has more.
 
 ## How it works
 
@@ -163,3 +208,19 @@ How the pieces fit:
 - **Animating:** it renders once per display refresh, paced by `DwmFlush`, and redraws only the area that changed.
 - **Window tracking:** WinEvent hooks and the shell hook report window changes, so there is no polling.
 - **Click-through:** the window region tracks the visible dock, so the transparent parts pass clicks to whatever is below.
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how
+to build, test and send a change, and [PLAN.md](PLAN.md) lists what's being worked on. Please follow
+the [Code of Conduct](CODE_OF_CONDUCT.md), and report security issues as [SECURITY.md](SECURITY.md)
+describes rather than in a public issue.
+
+## Support
+
+Windock is free and always will be. If it's useful to you, you can
+[buy me a coffee](https://buymeacoffee.com/jolley).
+
+## License
+
+[MIT](LICENSE)

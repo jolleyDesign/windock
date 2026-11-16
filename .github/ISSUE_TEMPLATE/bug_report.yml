@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in Windock doesn't work as it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Screenshots or a short clip help a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set `position = "left"`
+        2. Hover an app with two windows
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: From `winver`, e.g. Windows 11 24H2 (26100.2605)
+    validations:
+      required: true
+  - type: input
+    id: windock
+    attributes:
+      label: Windock version or commit
+      description: The first line of the log says `starting Windock <version>`; add the commit if you built it yourself.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Monitors and scaling, whether the taskbar is hidden, and anything else that seems relevant.
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: The relevant parts of `%APPDATA%\Windock\config.toml`. Remove anything you'd rather not share, such as paths.
+      render: toml
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The end of `%APPDATA%\Windock\windock.log`. It can include app names and paths; remove anything you'd rather not share.
+      render: text

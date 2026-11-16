@@ -3,6 +3,11 @@ name = "windock"
 version = "0.1.0"
 edition = "2024"
 description = "A clean, customizable dock for Windows"
+license = "MIT"
+repository = "https://github.com/jolleyDesign/windock"
+readme = "README.md"
+keywords = ["dock", "windows", "taskbar", "launcher", "desktop"]
+categories = ["gui"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

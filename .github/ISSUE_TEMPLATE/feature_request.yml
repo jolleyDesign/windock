@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest something Windock should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Check [PLAN.md](https://github.com/jolleyDesign/windock/blob/main/PLAN.md) first; it may already be planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem or the workflow, rather than the solution. "I keep losing track of downloads" says more than "add progress bars".
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Windock to do?
+      description: How it might look or work, and how other docks or the taskbar handle it, if you know.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you've tried instead?
