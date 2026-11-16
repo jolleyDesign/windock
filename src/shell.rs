@@ -163,7 +163,7 @@ pub fn file_description(path: &str) -> Option<String> {
         let mut langs = vec![(0x0409u16, 0x04b0u16)];
         if VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool() && len >= 4 {
             let pairs = std::slice::from_raw_parts(ptr as *const u16, (len / 2) as usize);
-            langs = pairs.chunks_exact(2).map(|c| (c[0], c[1])).chain(langs).collect();
+            langs = pairs.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).chain(langs).collect();
         }
         for (lang, cp) in langs {
             let key = wide(&format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\FileDescription"));

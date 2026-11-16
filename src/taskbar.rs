@@ -68,7 +68,9 @@ fn favorites_blob() -> Option<Vec<u8>> {
 /// ASCII-lowercases UTF-16LE text so searches ignore case.
 fn lower_utf16(bytes: &[u8]) -> Vec<u8> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|c| {
             let unit = u16::from_le_bytes([c[0], c[1]]);
             let lower = if unit < 128 { (unit as u8).to_ascii_lowercase() as u16 } else { unit };
@@ -96,7 +98,8 @@ fn find_utf16(blob: &[u8], text: &str) -> Option<usize> {
 fn store_app_ids(blob: &[u8]) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for align in 0..2 {
-        let units: Vec<(usize, u16)> = blob.get(align..).unwrap_or_default().chunks_exact(2).enumerate().map(|(i, c)| (align + i * 2, u16::from_le_bytes([c[0], c[1]]))).collect();
+        let units: Vec<(usize, u16)> =
+            blob.get(align..).unwrap_or_default().as_chunks::<2>().0.iter().enumerate().map(|(i, c)| (align + i * 2, u16::from_le_bytes([c[0], c[1]]))).collect();
         let mut token = String::new();
         let mut start = 0;
         for (pos, unit) in units.iter().copied().chain(std::iter::once((usize::MAX, 0))) {

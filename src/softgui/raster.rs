@@ -78,7 +78,7 @@ impl Raster {
         if clip[0] >= clip[2] || clip[1] >= clip[3] {
             return;
         }
-        for tri in mesh.indices.chunks_exact(3) {
+        for tri in mesh.indices.as_chunks::<3>().0.iter() {
             let v = [tri[0], tri[1], tri[2]].map(|i| &mesh.vertices[i as usize]);
             triangle(&mut self.pixels, self.width, tex, v, ppp, clip);
         }

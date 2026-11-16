@@ -85,9 +85,9 @@ fn load(source: &str, size: u32) -> Option<IconPixels> {
 
 unsafe fn bitmap_pixels(hbm: HBITMAP) -> Option<IconPixels> {
     let mut px = unsafe { raw_pixels(hbm) }?;
-    if px.data.chunks_exact(4).all(|p| p[3] == 0) {
+    if px.data.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
         // No alpha channel at all: the image is opaque.
-        px.data.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+        px.data.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[3] = 255);
     } else {
         premultiply(&mut px);
     }
@@ -127,8 +127,8 @@ unsafe fn raw_pixels(hbm: HBITMAP) -> Option<IconPixels> {
 
 /// Direct2D wants premultiplied alpha; leaves pixels that already are alone.
 fn premultiply(px: &mut IconPixels) {
-    if px.data.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
-        for p in px.data.chunks_exact_mut(4) {
+    if px.data.as_chunks::<4>().0.iter().any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
+        for p in px.data.as_chunks_mut::<4>().0.iter_mut() {
             let a = p[3] as u32;
             for c in &mut p[..3] {
                 *c = ((*c as u32 * a + 127) / 255) as u8;
@@ -148,9 +148,9 @@ pub fn icon_pixels(icon: HICON) -> Option<IconPixels> {
         let _ = DeleteObject(info.hbmColor.into());
         let _ = DeleteObject(info.hbmMask.into());
         let mut px = color?;
-        if px.data.chunks_exact(4).all(|p| p[3] == 0) {
+        if px.data.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
             let mask = mask.filter(|m| m.width == px.width && m.height >= px.height)?;
-            for (p, m) in px.data.chunks_exact_mut(4).zip(mask.data.chunks_exact(4)) {
+            for (p, m) in px.data.as_chunks_mut::<4>().0.iter_mut().zip(mask.data.as_chunks::<4>().0.iter()) {
                 if m[0] != 0 {
                     p.copy_from_slice(&[0, 0, 0, 0]);
                 } else {
