@@ -5,7 +5,9 @@ and versions will follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-The first release will include:
+## [0.1.0] - 2026-11-16
+
+The first release.
 
 ### Added
 
